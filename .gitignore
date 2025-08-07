@@ -1,0 +1,6 @@
+entradas/
+renomeados/
+pendentes/
+__pycache__/
+*.pyc
+.env
