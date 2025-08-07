@@ -1,0 +1,4 @@
+{
+  "build": { "builder": "NIXPACKS" },
+  "deploy": { "startCommand": "python renomear_cte_mesma_pasta.py" }
+}
