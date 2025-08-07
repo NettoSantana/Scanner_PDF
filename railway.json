@@ -1,7 +1,7 @@
 {
   "builds": [
     {
-      "base": "python:3.9",
+      "base": "ubuntu:20.04", 
       "commands": [
         "apt-get update",
         "apt-get install -y poppler-utils"
