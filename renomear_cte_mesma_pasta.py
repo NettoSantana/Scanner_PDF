@@ -2,6 +2,7 @@ import os
 import re
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
+import requests
 
 # Carrega variáveis do .env (se existir)
 load_dotenv()
@@ -77,6 +78,20 @@ def enviar_whatsapp(alerta_texto: str):
         Client(sid, token).messages.create(from_=w_from, to=w_to, body=alerta_texto)
     except Exception as e:
         print(f"⚠️ Falha ao enviar WhatsApp (Twilio): {e}")
+
+# ===== Função para Receber Arquivos via Twilio =====
+def salvar_pdf_twilio(media_url, media_sid):
+    # Baixar o arquivo PDF do Twilio
+    response = requests.get(media_url)
+    if response.status_code == 200:
+        caminho_pdf = os.path.join(PASTA_ENTRADAS, f"{media_sid}.pdf")
+        with open(caminho_pdf, 'wb') as f:
+            f.write(response.content)
+        print(f"📥 Arquivo {media_sid}.pdf recebido e salvo na pasta entradas.")
+        return caminho_pdf
+    else:
+        print(f"⚠️ Falha ao baixar o arquivo do Twilio. Status: {response.status_code}")
+        return None
 
 # ===== Execução =====
 def processar():
