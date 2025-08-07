@@ -1,6 +1,36 @@
+# Arquivos de credenciais e chaves
+credenciais_google.json
+*.key
+*.pem
+
+# Pastas de entrada e saída de PDFs
 entradas/
 renomeados/
 pendentes/
+imagens_extraidas/
+
+# Arquivos temporários e logs
+*.log
+*.tmp
+*.temp
+*.txt
+*.png
+*.jpg
+*.jpeg
+
+# Arquivos do Python
 __pycache__/
 *.pyc
-.env
+*.pyo
+*.pyd
+
+# Ambiente virtual
+venv/
+.env/
+
+# Configurações do sistema
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
