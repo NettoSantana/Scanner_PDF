@@ -1,10 +1,11 @@
 {
   "builds": [
     {
-      "base": "ubuntu:20.04", 
+      "base": "ghcr.io/railwayapp/nixpacks:ubuntu-1745885067",
       "commands": [
         "apt-get update",
-        "apt-get install -y poppler-utils"
+        "apt-get install -y poppler-utils",
+        "echo 'Poppler instalado com sucesso!' > /tmp/poppler_installed.txt"
       ]
     }
   ],
