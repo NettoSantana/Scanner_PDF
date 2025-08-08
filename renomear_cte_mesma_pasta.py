@@ -177,3 +177,6 @@ def processar():
 
 if __name__ == "__main__":
     processar()
+# Adicionando um comentário para forçar a alteração
+# Forçando uma alteração para o Git
+print("Verificando o Poppler...")
