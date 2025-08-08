@@ -3,15 +3,27 @@ import re
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
 import requests
+import subprocess
 
-# Verificar se o Poppler está instalado
-os.system("pdftotext -v")
+# Verificar se o Poppler está instalado e acessível no PATH
+def verificar_poppler():
+    try:
+        # Verifica se o Poppler está no PATH
+        poppler_path = subprocess.check_output("which pdftoppm", shell=True).decode('utf-8').strip()
+        if poppler_path:
+            print(f"Poppler está no PATH: {poppler_path}")
+        else:
+            print("Poppler não encontrado no PATH.")
+    except subprocess.CalledProcessError:
+        print("Erro ao tentar encontrar Poppler no PATH.")
+
+# Verificar o Poppler no início
+verificar_poppler()
 
 # Carrega variáveis do .env (se existir)
 load_dotenv()
 
 # ===== Raiz do projeto (portável: local/servidor) =====
-# Se quiser forçar em produção, defina BASE_DIR no ambiente.
 BASE_DIR = os.getenv("BASE_DIR") or os.path.dirname(os.path.abspath(__file__))
 
 PASTA_ENTRADAS  = os.path.join(BASE_DIR, "entradas")
