@@ -5,11 +5,11 @@ FROM ubuntu:20.04
 RUN apt-get update && \
     apt-get install -y poppler-utils python3 python3-pip python3-venv
 
-# Instalar o PyMuPDF diretamente
+# Instalar o PyMuPDF
 RUN pip3 install PyMuPDF==1.24.9
 
-# Instalar o python-dotenv
-RUN pip3 install python-dotenv==1.0.1
+# Instalar o requests
+RUN pip3 install requests==2.32.4
 
 # Definir o diretório de trabalho
 WORKDIR /app
