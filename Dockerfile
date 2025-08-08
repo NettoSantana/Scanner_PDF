@@ -25,3 +25,9 @@ RUN python3 -m venv /opt/venv && . /opt/venv/bin/activate && pip install -r requ
 
 # Comando para rodar o script
 CMD ["python3", "renomear_cte_mesma_pasta.py"]
+# Instalar dependências
+RUN apt-get update && \
+    apt-get install -y poppler-utils python3 python3-pip python3-venv
+
+# Verificar se o Poppler foi instalado corretamente
+RUN pdftoppm -v
