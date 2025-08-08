@@ -11,6 +11,9 @@ RUN pip3 install PyMuPDF==1.24.9
 # Instalar o requests
 RUN pip3 install requests==2.32.4
 
+# Instalar o python-dotenv
+RUN pip3 install python-dotenv==1.0.1
+
 # Definir o diretório de trabalho
 WORKDIR /app
 
