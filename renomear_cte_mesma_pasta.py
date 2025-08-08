@@ -4,6 +4,9 @@ import fitz  # PyMuPDF
 from dotenv import load_dotenv
 import requests
 
+# Verificar se o Poppler está instalado
+os.system("pdftotext -v")
+
 # Carrega variáveis do .env (se existir)
 load_dotenv()
 
