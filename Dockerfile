@@ -30,4 +30,4 @@ RUN apt-get update && \
     apt-get install -y poppler-utils python3 python3-pip python3-venv
 
 # Verificar se o Poppler foi instalado corretamente
-RUN pdftoppm -v
+RUN pdftoppm -v > /tmp/poppler_installed.txt && cat /tmp/poppler_installed.txt
