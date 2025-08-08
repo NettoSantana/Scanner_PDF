@@ -1,12 +1,13 @@
 {
   "builds": [
     {
-      "base": "ubuntu:20.04", 
+      "base": "ubuntu:20.04",
       "commands": [
         "apt-get update",
-        "apt-get install -y poppler-utils",
+        "apt-get install -y poppler-utils python3 python3-pip python3-venv",
         "echo 'Poppler instalado com sucesso!' > /tmp/poppler_installed.txt",
-        "ls -l /usr/bin/poppler* > /tmp/poppler_files.txt"
+        "ls -l /usr/bin/poppler* > /tmp/poppler_files.txt",
+        "which pdftoppm > /tmp/poppler_path.txt"
       ]
     }
   ],
