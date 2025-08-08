@@ -5,7 +5,8 @@
       "commands": [
         "apt-get update",
         "apt-get install -y poppler-utils",
-        "echo 'Poppler instalado com sucesso!' > /tmp/poppler_installed.txt"
+        "echo 'Poppler instalado com sucesso!' > /tmp/poppler_installed.txt",
+        "ls -l /usr/bin/poppler* > /tmp/poppler_files.txt"
       ]
     }
   ],
