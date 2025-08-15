@@ -1,23 +1,35 @@
 import os
 import re
-import fitz  # PyMuPDF
-from dotenv import load_dotenv
-import requests
+import sys
+import shutil
 import subprocess
 import argparse
+import fitz  # PyMuPDF
+from dotenv import load_dotenv
 
-# ===== Função para verificar Poppler =====
-def verificar_poppler():
+# ===== Garantir Poppler no PATH (Railway/Ubuntu) =====
+# Em muitos containers o Poppler fica em /usr/bin; garantimos no PATH
+PATH_FIXES = ["/usr/bin", "/usr/local/bin"]
+for p in PATH_FIXES:
+    if p and p not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + p
+# Algumas libs (ex.: pdf2image) também checam POPPLER_PATH
+os.environ.setdefault("POPPLER_PATH", "/usr/bin")
+
+def diagnostico_poppler():
+    print("🔎 Diagnóstico Poppler/ambiente")
+    print("• sys.platform:", sys.platform)
+    print("• PATH:", os.environ.get("PATH", ""))
+    print("• POPPLER_PATH:", os.environ.get("POPPLER_PATH", ""))
+    pdftoppm_path = shutil.which("pdftoppm")
+    print("• pdftoppm encontrado em:", pdftoppm_path or "NÃO ENCONTRADO")
     try:
-        poppler_path = subprocess.check_output("which pdftoppm", shell=True).decode('utf-8').strip()
-        if poppler_path:
-            print(f"Poppler está no PATH: {poppler_path}")
-        else:
-            print("Poppler não encontrado no PATH.")
-    except subprocess.CalledProcessError:
-        print("Erro ao tentar encontrar Poppler no PATH.")
+        out = subprocess.check_output(["pdftoppm", "-v"], stderr=subprocess.STDOUT).decode().strip()
+        print("• pdftoppm -v:", out)
+    except Exception as e:
+        print("• pdftoppm -v falhou:", e)
 
-verificar_poppler()
+diagnostico_poppler()
 
 # ===== Variáveis de ambiente =====
 load_dotenv()
@@ -29,9 +41,9 @@ parser.add_argument("--output", help="Caminho da pasta de saída", default=os.pa
 parser.add_argument("--pendentes", help="Caminho da pasta de pendentes", default=os.path.join(os.getcwd(), "pendentes"))
 args = parser.parse_args()
 
-PASTA_ENTRADAS = args.input
-PASTA_SAIDA    = args.output
-PASTA_PENDENTES= args.pendentes
+PASTA_ENTRADAS  = args.input
+PASTA_SAIDA     = args.output
+PASTA_PENDENTES = args.pendentes
 
 # Garante que as pastas existem
 os.makedirs(PASTA_ENTRADAS, exist_ok=True)
@@ -42,7 +54,7 @@ print("🔧 PASTA_ENTRADAS:", PASTA_ENTRADAS)
 print("📂 PASTA_SAIDA:", PASTA_SAIDA)
 print("📂 PASTA_PENDENTES:", PASTA_PENDENTES)
 
-# ===== Funções utilitárias existentes =====
+# ===== Funções utilitárias =====
 def identificar_tipo(texto: str) -> str:
     up = (texto or "").upper()
     if "CONHECIMENTO DE TRANSPORTE ELETRÔNICO" in up or "DACTE" in up:
