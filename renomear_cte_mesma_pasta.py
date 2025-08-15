@@ -4,11 +4,11 @@ import fitz  # PyMuPDF
 from dotenv import load_dotenv
 import requests
 import subprocess
+import argparse
 
-# Verificar se o Poppler está instalado e acessível no PATH
+# ===== Função para verificar Poppler =====
 def verificar_poppler():
     try:
-        # Verifica se o Poppler está no PATH
         poppler_path = subprocess.check_output("which pdftoppm", shell=True).decode('utf-8').strip()
         if poppler_path:
             print(f"Poppler está no PATH: {poppler_path}")
@@ -17,30 +17,32 @@ def verificar_poppler():
     except subprocess.CalledProcessError:
         print("Erro ao tentar encontrar Poppler no PATH.")
 
-# Verificar o Poppler no início
 verificar_poppler()
 
-# Carrega variáveis do .env (se existir)
+# ===== Variáveis de ambiente =====
 load_dotenv()
 
-# ===== Raiz do projeto (portável: local/servidor) =====
-BASE_DIR = os.getenv("BASE_DIR") or os.path.dirname(os.path.abspath(__file__))
+# ===== Parser para receber argumentos =====
+parser = argparse.ArgumentParser(description="Processar PDFs recebidos via Twilio")
+parser.add_argument("--input", help="Caminho da pasta de entrada", default=os.path.join(os.getcwd(), "entradas"))
+parser.add_argument("--output", help="Caminho da pasta de saída", default=os.path.join(os.getcwd(), "renomeados"))
+parser.add_argument("--pendentes", help="Caminho da pasta de pendentes", default=os.path.join(os.getcwd(), "pendentes"))
+args = parser.parse_args()
 
-PASTA_ENTRADAS  = os.path.join(BASE_DIR, "entradas")
-PASTA_SAIDA     = os.path.join(BASE_DIR, "renomeados")
-PASTA_PENDENTES = os.path.join(BASE_DIR, "pendentes")
+PASTA_ENTRADAS = args.input
+PASTA_SAIDA    = args.output
+PASTA_PENDENTES= args.pendentes
 
 # Garante que as pastas existem
 os.makedirs(PASTA_ENTRADAS, exist_ok=True)
 os.makedirs(PASTA_SAIDA, exist_ok=True)
 os.makedirs(PASTA_PENDENTES, exist_ok=True)
 
-print("🔧 BASE_DIR:", BASE_DIR)
-print("📂 PASTA_ENTRADAS:", PASTA_ENTRADAS)
+print("🔧 PASTA_ENTRADAS:", PASTA_ENTRADAS)
 print("📂 PASTA_SAIDA:", PASTA_SAIDA)
 print("📂 PASTA_PENDENTES:", PASTA_PENDENTES)
 
-# ===== Detecção de tipo =====
+# ===== Funções utilitárias existentes =====
 def identificar_tipo(texto: str) -> str:
     up = (texto or "").upper()
     if "CONHECIMENTO DE TRANSPORTE ELETRÔNICO" in up or "DACTE" in up:
@@ -51,7 +53,6 @@ def identificar_tipo(texto: str) -> str:
         return "BOLETO"
     return "DESCONHECIDO"
 
-# ===== Modelos de CTE conhecidos =====
 MODELOS = {
     "WANDER_PEREIRA_DE_MATOS": {
         "regex_emissor": r'\n([A-Z ]{5,})\s+CNPJ:\s*[\d./-]+\s+IE:',
@@ -63,13 +64,11 @@ MODELOS = {
     }
 }
 
-# ===== Utils =====
 def slugify(nome: str) -> str:
     nome = re.sub(r'\W+', '_', (nome or '').strip())
     return re.sub(r'_+', '_', nome).strip('_') or 'DESCONHECIDO'
 
 def nome_unico(caminho_base: str) -> str:
-    """Se o arquivo existir, acrescenta __1, __2, ..."""
     if not os.path.exists(caminho_base):
         return caminho_base
     raiz, ext = os.path.splitext(caminho_base)
@@ -80,45 +79,11 @@ def nome_unico(caminho_base: str) -> str:
             return novo
         i += 1
 
-def enviar_whatsapp(alerta_texto: str):
-    """Envio opcional via Twilio. Suporta TWILIO_* antigo e novo."""
-    sid    = os.getenv("TWILIO_SID")            or os.getenv("TWILIO_ACCOUNT_SID")
-    token  = os.getenv("TWILIO_AUTH")           or os.getenv("TWILIO_AUTH_TOKEN")
-    w_from = os.getenv("TWILIO_FROM")           or os.getenv("TWILIO_WHATSAPP_FROM")
-    w_to   = os.getenv("TWILIO_TO")             or os.getenv("TWILIO_WHATSAPP_TO")
-    if not (sid and token and w_from and w_to):
-        return  # não configurado -> silencioso
-    try:
-        from twilio.rest import Client
-        Client(sid, token).messages.create(from_=w_from, to=w_to, body=alerta_texto)
-    except Exception as e:
-        print(f"⚠️ Falha ao enviar WhatsApp (Twilio): {e}")
-
-# ===== Função para Receber Arquivos via Twilio =====
-def salvar_pdf_twilio(media_url, media_sid):
-    # Baixar o arquivo PDF do Twilio
-    response = requests.get(media_url)
-    if response.status_code == 200:
-        caminho_pdf = os.path.join(PASTA_ENTRADAS, f"{media_sid}.pdf")
-        with open(caminho_pdf, 'wb') as f:
-            f.write(response.content)
-        print(f"📥 Arquivo {media_sid}.pdf recebido e salvo na pasta entradas.")
-        return caminho_pdf
-    else:
-        print(f"⚠️ Falha ao baixar o arquivo do Twilio. Status: {response.status_code}")
-        return None
-
-# ===== Execução =====
+# ===== Função principal =====
 def processar():
-    # Lista PDFs; se vazio, apenas loga (sem crash)
-    try:
-        pdfs = [f for f in os.listdir(PASTA_ENTRADAS) if f.lower().endswith('.pdf')]
-    except FileNotFoundError:
-        print("❌ Pasta de entradas não encontrada:", PASTA_ENTRADAS)
-        return
-
+    pdfs = [f for f in os.listdir(PASTA_ENTRADAS) if f.lower().endswith('.pdf')]
     if not pdfs:
-        print("ℹ️ Nenhum PDF em", PASTA_ENTRADAS, "- suba arquivos para processar.")
+        print("ℹ️ Nenhum PDF em", PASTA_ENTRADAS)
         return
 
     for nome_arquivo in pdfs:
@@ -131,7 +96,6 @@ def processar():
                 for i, pagina in enumerate(doc):
                     nova_doc = fitz.open()
                     nova_doc.insert_pdf(doc, from_page=i, to_page=i)
-
                     texto = pagina.get_text() or ""
                     tipo_doc = identificar_tipo(texto)
 
@@ -140,7 +104,6 @@ def processar():
                     modelo_usado = None
 
                     if tipo_doc == "CTE":
-                        # Tenta casar com modelos conhecidos
                         for modelo, regras in MODELOS.items():
                             if re.search(regras["regex_emissor"], texto, re.IGNORECASE):
                                 modelo_usado = modelo
@@ -152,20 +115,12 @@ def processar():
                                     numero_doc = m_num.group(1)
                                 break
 
-                    # Monta nome final COM prefixo do arquivo original
                     nome_info = f"{slugify(nome_emissor)}_{tipo_doc}_{numero_doc}.pdf"
                     nome_final = f"{prefixo_original}__{nome_info}"
 
                     if tipo_doc != "CTE" or not modelo_usado:
-                        print(f"⚠️ {('Tipo ' + tipo_doc) if tipo_doc!='CTE' else 'Modelo CTE desconhecido'} na página {i+1}. Enviado para pendentes.")
                         caminho_destino = nome_unico(os.path.join(PASTA_PENDENTES, nome_final))
                         nova_doc.save(caminho_destino)
-
-                        # Salva texto extraído para facilitar criação de novo modelo
-                        with open(f"{caminho_destino}.txt", "w", encoding="utf-8") as f:
-                            f.write(texto)
-
-                        enviar_whatsapp(f"⚠️ Documento pendente: {os.path.basename(caminho_destino)}")
                     else:
                         caminho_destino = nome_unico(os.path.join(PASTA_SAIDA, nome_final))
                         nova_doc.save(caminho_destino)
@@ -177,6 +132,3 @@ def processar():
 
 if __name__ == "__main__":
     processar()
-# Adicionando um comentário para forçar a alteração
-# Forçando uma alteração para o Git
-print("Verificando o Poppler...")
