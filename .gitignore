@@ -1,36 +1,58 @@
-# Arquivos de credenciais e chaves
-credenciais_google.json
+# Credenciais / segredos
+.env
+.env.*
 *.key
 *.pem
+*.pfx
+*credentials*.json
+*credenciais*.json
+secrets*.json
 
-# Pastas de entrada e saída de PDFs
+# Pastas de trabalho (geradas em runtime)
 entradas/
 renomeados/
 pendentes/
 imagens_extraidas/
+tmp/
+logs/
 
-# Arquivos temporários e logs
+# Logs (sem bloquear txt do repo)
 *.log
-*.tmp
-*.temp
-*.txt
-*.png
-*.jpg
-*.jpeg
+logs/**/*.log
 
-# Arquivos do Python
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.pyd
-
-# Ambiente virtual
+*.so
+*.dylib
+.venv/
 venv/
-.env/
+ENV/
+env/
+pip-wheel-metadata/
+*.egg-info/
+dist/
+build/
 
-# Configurações do sistema
+# Testes / linters
+.pytest_cache/
+.coverage
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# IDE / SO
+.vscode/
+.idea/
+.fleet/
 .DS_Store
 Thumbs.db
 
-# VS Code
-.vscode/
+# Outros
+*.msi
+*.sqlite
+*.sqlite3
+
+*.dll

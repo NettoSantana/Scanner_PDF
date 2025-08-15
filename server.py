@@ -1,42 +1,67 @@
-import os, requests
+import os
+from datetime import datetime
 from flask import Flask, request, Response
 from dotenv import load_dotenv
-from datetime import datetime
+import requests
 
 load_dotenv()
 
-PASTA_ENTRADAS = r'C:\Users\vlula\ScannerOCR\entradas'
-os.makedirs(PASTA_ENTRADAS, exist_ok=True)
+# Pasta de entrada (compatível com Linux/Docker)
+INPUT_DIR = os.getenv("INPUT_DIR", os.path.join(os.getcwd(), "entradas"))
+os.makedirs(INPUT_DIR, exist_ok=True)
+
+# Credenciais para baixar mídia da Twilio (URLs exigem Basic Auth)
+TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
 app = Flask(__name__)
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}, 200
+
 @app.post("/whatsapp")
 def whatsapp_webhook():
-    # Dados básicos
     from_number = request.form.get("From", "")
-    body = request.form.get("Body", "")
-    num_media = int(request.form.get("NumMedia", "0"))
+    num_media = int(request.form.get("NumMedia", "0") or 0)
 
-    # Se veio mídia e for PDF, baixa
-    if num_media > 0:
-        content_type = request.form.get("MediaContentType0", "")
-        media_url = request.form.get("MediaUrl0", "")
-        if content_type == "application/pdf" and media_url:
-            # Baixa o PDF
-            r = requests.get(media_url, timeout=30)
-            r.raise_for_status()
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            nome = f"zap_{stamp}.pdf"
-            caminho = os.path.join(PASTA_ENTRADAS, nome)
-            with open(caminho, "wb") as f:
-                f.write(r.content)
-            print(f"📥 Recebido via WhatsApp de {from_number}: {nome}")
-            # aqui você pode chamar seu script de processamento (opcional por enquanto)
-            # os.system("python renomear_cte_mesma_pasta.py")
-            return Response("PDF recebido. Processamento em fila.", 200)
+    if num_media <= 0:
+        return Response("Envie um PDF do CT-e.", 200)
 
-    # Sem mídia ou não-PDF
-    return Response("Envie um PDF do CT-e.", 200)
+    salvos = []
+    for i in range(num_media):
+        content_type = request.form.get(f"MediaContentType{i}", "") or ""
+        media_url    = request.form.get(f"MediaUrl{i}", "") or ""
+        if "pdf" not in content_type.lower() or not media_url:
+            continue
+
+        try:
+            # Auth só se tivermos SID/TOKEN; senão tenta sem (pode falhar)
+            auth = (TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
+
+            with requests.get(media_url, stream=True, timeout=30, auth=auth) as r:
+                r.raise_for_status()
+                stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                nome  = f"zap_{stamp}_{i+1}.pdf"
+                caminho = os.path.join(INPUT_DIR, nome)
+                with open(caminho, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                salvos.append(nome)
+                print(f"📥 PDF salvo de {from_number}: {nome}")
+        except Exception as e:
+            print(f"⚠️ Falha ao baixar mídia {i}: {e}")
+
+    if salvos:
+        # Opcional: chamar processamento aqui (deixe comentado se preferir fila/cron)
+        # import renomear_cte_mesma_pasta as proc
+        # proc.processar()
+
+        return Response(f"Recebido(s): {', '.join(salvos)}. Processamento em fila.", 200)
+    else:
+        return Response("Nenhum PDF válido encontrado no envio.", 200)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)

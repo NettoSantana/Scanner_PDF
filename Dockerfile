@@ -1,26 +1,33 @@
-# Usar a imagem base do Ubuntu
+# Base Ubuntu
 FROM ubuntu:20.04
 
-# Instalar dependências
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Dependências do sistema (Poppler + ZBar + Python)
 RUN apt-get update && \
-    apt-get install -y poppler-utils python3 python3-pip python3-venv
+    apt-get install -y --no-install-recommends \
+      poppler-utils \
+      libzbar0 \
+      python3 python3-pip python3-venv && \
+    rm -rf /var/lib/apt/lists/*
 
-# Verificar a instalação do Poppler
-RUN pdftoppm -v
+# Virtualenv padrão do container
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+ENV POPPLER_PATH="/usr/bin"
 
-# Instalar as dependências Python
-RUN pip3 install PyMuPDF==1.24.9
-RUN pip3 install requests==2.32.4
-RUN pip3 install python-dotenv==1.0.1
-
-# Definir o diretório de trabalho
+# Diretório de trabalho
 WORKDIR /app
 
-# Copiar os arquivos do projeto
+# Instalar dependências Python com cache eficiente
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copiar o restante do projeto
 COPY . /app
 
-# Instalar as dependências do Python
-RUN python3 -m venv /opt/venv && . /opt/venv/bin/activate && pip install -r requirements.txt
-
-# Comando para rodar o script
-CMD ["python3", "renomear_cte_mesma_pasta.py"]
+# Comando padrão (ajuste se mudar o script principal)
+CMD bash -lc 'gunicorn -w 2 -k gthread --threads 4 --timeout 120 -b 0.0.0.0:$PORT server:app'
