@@ -9,7 +9,6 @@ import fitz  # PyMuPDF
 from dotenv import load_dotenv
 
 # ================== Ambiente / Poppler (diagnóstico defensivo) ==================
-# Em containers Ubuntu (Railway/Docker), binários ficam aqui:
 for p in ("/usr/bin", "/usr/local/bin"):
     if p not in os.environ.get("PATH", ""):
         os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + p
@@ -26,7 +25,6 @@ def diagnostico_poppler():
             out = subprocess.check_output(["pdftoppm", "-v"], stderr=subprocess.STDOUT).decode(errors="replace").strip()
             print("• pdftoppm -v:", out)
     except Exception as e:
-        # Não aborta o fluxo se diagnóstico falhar
         print("• Aviso: diagnóstico Poppler falhou:", e)
 
 diagnostico_poppler()
@@ -34,16 +32,14 @@ diagnostico_poppler()
 # ================== Config / Args ==================
 load_dotenv()
 
-parser = argparse.ArgumentParser(description="Processa PDFs (split por página) e renomeia por tipo/emissor/número.")
-parser.add_argument("--input",     default=os.path.join(os.getcwd(), "entradas"),   help="Pasta de entrada")
-parser.add_argument("--output",    default=os.path.join(os.getcwd(), "renomeados"), help="Pasta de saída OK")
-parser.add_argument("--pendentes", default=os.path.join(os.getcwd(), "pendentes"),  help="Pasta de pendentes")
-args = parser.parse_args()
+def _dirs_from_env():
+    input_dir     = os.getenv("INPUT_DIR", os.path.join(os.getcwd(), "entradas"))
+    output_dir    = os.getenv("OUTPUT_DIR", os.path.join(os.getcwd(), "renomeados"))
+    pendentes_dir = os.getenv("PENDENTES_DIR", os.path.join(os.getcwd(), "pendentes"))
+    return input_dir, output_dir, pendentes_dir
 
-PASTA_ENTRADAS  = args.input
-PASTA_SAIDA     = args.output
-PASTA_PENDENTES = args.pendentes
-
+# Defaults para quando o módulo é importado (ex.: pelo server.py / gunicorn)
+PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES = _dirs_from_env()
 for pasta in (PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES):
     os.makedirs(pasta, exist_ok=True)
 
@@ -59,8 +55,8 @@ def remover_acentos(s: str) -> str:
 
 def slugify(nome: str) -> str:
     nome = remover_acentos((nome or "").strip())
-    nome = re.sub(r"\W+", "_", nome)           # troca não-alfanum por _
-    nome = re.sub(r"_+", "_", nome).strip("_") # colapsa _
+    nome = re.sub(r"\W+", "_", nome)
+    nome = re.sub(r"_+", "_", nome).strip("_")
     return nome or "DESCONHECIDO"
 
 def nome_unico(caminho_base: str) -> str:
@@ -84,7 +80,7 @@ def identificar_tipo(texto: str) -> str:
         return "BOLETO"
     return "DESCONHECIDO"
 
-# Regex pré-compiladas (case-insensitive)
+# Regex pré-compiladas
 MODELOS = {
     "WANDER_PEREIRA_DE_MATOS": {
         "regex_emissor": re.compile(r"\n([A-Z ]{5,})\s+CNPJ:\s*[\d./-]+\s+IE:", re.IGNORECASE),
@@ -101,7 +97,6 @@ def processar_pdf(caminho_pdf: str):
     prefixo_original = os.path.splitext(os.path.basename(caminho_pdf))[0]
     print(f"\n📄 Processando: {os.path.basename(caminho_pdf)}")
 
-    doc = None
     try:
         doc = fitz.open(caminho_pdf)
     except Exception as e:
@@ -134,7 +129,6 @@ def processar_pdf(caminho_pdf: str):
                 nome_info  = f"{slugify(nome_emissor)}_{tipo_doc}_{numero_doc}.pdf"
                 nome_final = f"{prefixo_original}__{nome_info}"
 
-                # extrai página i para um PDF novo
                 nova_doc = fitz.open()
                 nova_doc.insert_pdf(doc, from_page=i, to_page=i)
 
@@ -153,10 +147,11 @@ def processar_pdf(caminho_pdf: str):
 
             except Exception as e_pag:
                 print(f"⚠️ Erro na página {i+1}: {e_pag}")
-
     finally:
-        if doc is not None:
+        try:
             doc.close()
+        except Exception:
+            pass
 
 def processar():
     arquivos = [f for f in os.listdir(PASTA_ENTRADAS) if f.lower().endswith(".pdf")]
@@ -166,6 +161,19 @@ def processar():
     for nome in arquivos:
         processar_pdf(os.path.join(PASTA_ENTRADAS, nome))
 
-# ================== Main ==================
+# ================== Execução via CLI ==================
 if __name__ == "__main__":
+    # Só parseia argumentos quando rodado diretamente (não na importação)
+    parser = argparse.ArgumentParser(description="Processa PDFs e renomeia por tipo/emissor/número.")
+    parser.add_argument("--input",     default=PASTA_ENTRADAS,  help="Pasta de entrada")
+    parser.add_argument("--output",    default=PASTA_SAIDA,     help="Pasta de saída OK")
+    parser.add_argument("--pendentes", default=PASTA_PENDENTES, help="Pasta de pendentes")
+    args = parser.parse_args()
+
+    PASTA_ENTRADAS  = args.input
+    PASTA_SAIDA     = args.output
+    PASTA_PENDENTES = args.pendentes
+    for pasta in (PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES):
+        os.makedirs(pasta, exist_ok=True)
+
     processar()
