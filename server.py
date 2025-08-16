@@ -1,8 +1,12 @@
 import os
+import threading
 from datetime import datetime
 from flask import Flask, request, Response
 from dotenv import load_dotenv
 import requests
+
+# processamento
+import renomear_cte_mesma_pasta as proc
 
 load_dotenv()
 
@@ -30,15 +34,13 @@ def whatsapp_webhook():
 
     salvos = []
     for i in range(num_media):
-        content_type = request.form.get(f"MediaContentType{i}", "") or ""
+        content_type = (request.form.get(f"MediaContentType{i}", "") or "").lower()
         media_url    = request.form.get(f"MediaUrl{i}", "") or ""
-        if "pdf" not in content_type.lower() or not media_url:
+        if "pdf" not in content_type or not media_url:
             continue
 
         try:
-            # Auth só se tivermos SID/TOKEN; senão tenta sem (pode falhar)
             auth = (TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
-
             with requests.get(media_url, stream=True, timeout=30, auth=auth) as r:
                 r.raise_for_status()
                 stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -53,14 +55,12 @@ def whatsapp_webhook():
         except Exception as e:
             print(f"⚠️ Falha ao baixar mídia {i}: {e}")
 
-    if salvos:
-        # Opcional: chamar processamento aqui (deixe comentado se preferir fila/cron)
-        # import renomear_cte_mesma_pasta as proc
-        # proc.processar()
-
-        return Response(f"Recebido(s): {', '.join(salvos)}. Processamento em fila.", 200)
-    else:
+    if not salvos:
         return Response("Nenhum PDF válido encontrado no envio.", 200)
+
+    # dispara o processamento em segundo plano (não bloqueia webhook)
+    threading.Thread(target=proc.processar, daemon=True).start()
+    return Response(f"Recebido(s): {', '.join(salvos)}. Processamento iniciado.", 200)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
