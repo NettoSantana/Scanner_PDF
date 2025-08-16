@@ -125,3 +125,47 @@ def processar_pdf(caminho_pdf: str):
                             modelo_usado = modelo
                             m_emp = regras["regex_emissor"].search(texto)
                             if m_emp:
+                                nome_emissor = slugify(m_emp.group(1))
+                            m_num = regras["regex_cte"].search(texto)
+                            if m_num:
+                                numero_doc = m_num.group(1)
+                            break
+
+                nome_info  = f"{slugify(nome_emissor)}_{tipo_doc}_{numero_doc}.pdf"
+                nome_final = f"{prefixo_original}__{nome_info}"
+
+                # extrai página i para um PDF novo
+                nova_doc = fitz.open()
+                nova_doc.insert_pdf(doc, from_page=i, to_page=i)
+
+                if tipo_doc == "CTE" and modelo_usado:
+                    destino = nome_unico(os.path.join(PASTA_SAIDA, nome_final))
+                else:
+                    destino = nome_unico(os.path.join(PASTA_PENDENTES, nome_final))
+
+                nova_doc.save(destino, deflate=True, garbage=4)
+                nova_doc.close()
+
+                if tipo_doc == "CTE" and modelo_usado:
+                    print(f"✅ Página {i+1} ({modelo_usado}) salva: {os.path.basename(destino)}")
+                else:
+                    print(f"➜ Página {i+1} movida para pendentes: {os.path.basename(destino)}")
+
+            except Exception as e_pag:
+                print(f"⚠️ Erro na página {i+1}: {e_pag}")
+
+    finally:
+        if doc is not None:
+            doc.close()
+
+def processar():
+    arquivos = [f for f in os.listdir(PASTA_ENTRADAS) if f.lower().endswith(".pdf")]
+    if not arquivos:
+        print("ℹ️ Nenhum PDF em", PASTA_ENTRADAS)
+        return
+    for nome in arquivos:
+        processar_pdf(os.path.join(PASTA_ENTRADAS, nome))
+
+# ================== Main ==================
+if __name__ == "__main__":
+    processar()
