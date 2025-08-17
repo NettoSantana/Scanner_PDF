@@ -5,6 +5,7 @@ from datetime import datetime
 from flask import Flask, request, Response, send_from_directory, jsonify
 from dotenv import load_dotenv
 import requests
+from typing import List  # <<< Python 3.8: usar List
 
 # processamento
 import renomear_cte_mesma_pasta as proc
@@ -96,7 +97,7 @@ def _safe_remove(path: str):
     except Exception as e:
         print(f"⚠️ Erro ao remover {path}: {e}")
 
-def _schedule_delete(paths: list[str], delay: int):
+def _schedule_delete(paths: List[str], delay: int):  # <<< aqui
     def _job():
         for p in paths:
             absp = os.path.abspath(p)
