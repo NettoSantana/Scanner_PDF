@@ -1,7 +1,7 @@
 import os
 import threading
 from datetime import datetime
-from flask import Flask, request, Response
+from flask import Flask, request, Response, send_from_directory, jsonify
 from dotenv import load_dotenv
 import requests
 
@@ -10,11 +10,16 @@ import renomear_cte_mesma_pasta as proc
 
 load_dotenv()
 
-# Pasta de entrada (compatível com Linux/Docker)
-INPUT_DIR = os.getenv("INPUT_DIR", os.path.join(os.getcwd(), "entradas"))
-os.makedirs(INPUT_DIR, exist_ok=True)
+# Pastas (funciona em Linux/Docker)
+INPUT_DIR     = os.getenv("INPUT_DIR",     os.path.join(os.getcwd(), "entradas"))
+OUTPUT_DIR    = os.getenv("OUTPUT_DIR",    os.path.join(os.getcwd(), "renomeados"))
+PENDENTES_DIR = os.getenv("PENDENTES_DIR", os.path.join(os.getcwd(), "pendentes"))
 
-# Credenciais para baixar mídia da Twilio (URLs exigem Basic Auth)
+os.makedirs(INPUT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(PENDENTES_DIR, exist_ok=True)
+
+# Credenciais p/ baixar mídia da Twilio (URLs exigem Basic Auth)
 TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
@@ -24,6 +29,29 @@ app = Flask(__name__)
 def health():
     return {"status": "ok"}, 200
 
+# ---- LISTAGEM/DOWNLOAD ----
+@app.get("/files")
+def list_files():
+    out_files = sorted([f for f in os.listdir(OUTPUT_DIR) if f.lower().endswith(".pdf")])
+    pen_files = sorted([f for f in os.listdir(PENDENTES_DIR) if f.lower().endswith(".pdf")])
+    return jsonify({
+        "output_dir": OUTPUT_DIR,
+        "pendentes_dir": PENDENTES_DIR,
+        "output_count": len(out_files),
+        "pendentes_count": len(pen_files),
+        "output_files": out_files,
+        "pendentes_files": pen_files,
+    }), 200
+
+@app.get("/files/renomeados/<path:fname>")
+def download_renomeado(fname):
+    return send_from_directory(OUTPUT_DIR, fname, as_attachment=True)
+
+@app.get("/files/pendentes/<path:fname>")
+def download_pendente(fname):
+    return send_from_directory(PENDENTES_DIR, fname, as_attachment=True)
+
+# ---- WEBHOOK TWILIO ----
 @app.post("/whatsapp")
 def whatsapp_webhook():
     from_number = request.form.get("From", "")
