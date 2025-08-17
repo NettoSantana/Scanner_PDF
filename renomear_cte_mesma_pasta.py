@@ -22,7 +22,9 @@ def diagnostico_poppler():
         pdftoppm_path = shutil.which("pdftoppm")
         print("• pdftoppm:", pdftoppm_path or "NÃO ENCONTRADO")
         if pdftoppm_path:
-            out = subprocess.check_output(["pdftoppm", "-v"], stderr=subprocess.STDOUT).decode(errors="replace").strip()
+            out = subprocess.check_output(
+                ["pdftoppm", "-v"], stderr=subprocess.STDOUT
+            ).decode(errors="replace").strip()
             print("• pdftoppm -v:", out)
     except Exception as e:
         print("• Aviso: diagnóstico Poppler falhou:", e)
@@ -33,19 +35,24 @@ diagnostico_poppler()
 load_dotenv()
 
 def _dirs_from_env():
-    input_dir     = os.getenv("INPUT_DIR", os.path.join(os.getcwd(), "entradas"))
-    output_dir    = os.getenv("OUTPUT_DIR", os.path.join(os.getcwd(), "renomeados"))
-    pendentes_dir = os.getenv("PENDENTES_DIR", os.path.join(os.getcwd(), "pendentes"))
-    return input_dir, output_dir, pendentes_dir
+    base = os.getcwd()
+    input_dir      = os.getenv("INPUT_DIR",      os.path.join(base, "entradas"))
+    output_dir     = os.getenv("OUTPUT_DIR",     os.path.join(base, "renomeados"))
+    pendentes_dir  = os.getenv("PENDENTES_DIR",  os.path.join(base, "pendentes"))
+    processed_dir  = os.getenv("PROCESSED_DIR",  os.path.join(base, "processados"))
+    disposition    = os.getenv("INPUT_DISPOSITION", "move").lower()  # move | delete | keep
+    return input_dir, output_dir, pendentes_dir, processed_dir, disposition
 
-# Defaults para quando o módulo é importado (ex.: pelo server.py / gunicorn)
-PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES = _dirs_from_env()
-for pasta in (PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES):
+# Defaults quando importado (server/gunicorn)
+PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES, PASTA_PROCESSADOS, INPUT_DISPOSITION = _dirs_from_env()
+for pasta in (PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES, PASTA_PROCESSADOS):
     os.makedirs(pasta, exist_ok=True)
 
 print("🔧 PASTA_ENTRADAS:", PASTA_ENTRADAS)
 print("📂 PASTA_SAIDA:", PASTA_SAIDA)
 print("📂 PASTA_PENDENTES:", PASTA_PENDENTES)
+print("📦 PASTA_PROCESSADOS:", PASTA_PROCESSADOS)
+print("⚙️ INPUT_DISPOSITION:", INPUT_DISPOSITION)
 
 # ================== Utilidades ==================
 def remover_acentos(s: str) -> str:
@@ -93,8 +100,30 @@ MODELOS = {
 }
 
 # ================== Processamento ==================
+def _dispor_entrada(caminho_pdf: str):
+    """Após processar, decide o que fazer com o PDF de entrada para evitar reprocesso."""
+    try:
+        if INPUT_DISPOSITION == "delete":
+            os.remove(caminho_pdf)
+            print(f"🗑️ Entrada removida: {os.path.basename(caminho_pdf)}")
+        elif INPUT_DISPOSITION == "move":
+            os.makedirs(PASTA_PROCESSADOS, exist_ok=True)
+            destino = os.path.join(PASTA_PROCESSADOS, os.path.basename(caminho_pdf))
+            # evita overwrite do arquivo de entrada arquivado
+            if os.path.exists(destino):
+                base, ext = os.path.splitext(destino)
+                k = 1
+                while os.path.exists(f"{base}__{k}{ext}"):
+                    k += 1
+                destino = f"{base}__{k}{ext}"
+            shutil.move(caminho_pdf, destino)
+            print(f"📦 Entrada arquivada em: {destino}")
+        else:
+            print("ℹ️ INPUT_DISPOSITION=keep — mantendo entradas (pode reprocessar em futuras chamadas).")
+    except Exception as e:
+        print(f"⚠️ Falha ao dispor entrada: {e}")
+
 def processar_pdf(caminho_pdf: str):
-    prefixo_original = os.path.splitext(os.path.basename(caminho_pdf))[0]
     print(f"\n📄 Processando: {os.path.basename(caminho_pdf)}")
 
     try:
@@ -126,8 +155,8 @@ def processar_pdf(caminho_pdf: str):
                                 numero_doc = m_num.group(1)
                             break
 
-                nome_info  = f"{slugify(nome_emissor)}_{tipo_doc}_{numero_doc}.pdf"
-                nome_final = f"{prefixo_original}__{nome_info}"
+                # Nome final SEM prefixo zap_...__
+                nome_final = f"{slugify(nome_emissor)}_{tipo_doc}_{numero_doc}.pdf"
 
                 nova_doc = fitz.open()
                 nova_doc.insert_pdf(doc, from_page=i, to_page=i)
@@ -153,7 +182,17 @@ def processar_pdf(caminho_pdf: str):
         except Exception:
             pass
 
+    # Dispor a entrada para não reprocessar em chamadas futuras
+    _dispor_entrada(caminho_pdf)
+
+def processar_arquivos(caminhos: list):
+    """Processa somente os PDFs informados (para uso pelo server)."""
+    for c in caminhos:
+        if c and c.lower().endswith(".pdf") and os.path.exists(c):
+            processar_pdf(c)
+
 def processar():
+    """Processa TUDO que estiver em PASTA_ENTRADAS (modo legado/CLI)."""
     arquivos = [f for f in os.listdir(PASTA_ENTRADAS) if f.lower().endswith(".pdf")]
     if not arquivos:
         print("ℹ️ Nenhum PDF em", PASTA_ENTRADAS)
@@ -163,17 +202,21 @@ def processar():
 
 # ================== Execução via CLI ==================
 if __name__ == "__main__":
-    # Só parseia argumentos quando rodado diretamente (não na importação)
     parser = argparse.ArgumentParser(description="Processa PDFs e renomeia por tipo/emissor/número.")
     parser.add_argument("--input",     default=PASTA_ENTRADAS,  help="Pasta de entrada")
     parser.add_argument("--output",    default=PASTA_SAIDA,     help="Pasta de saída OK")
     parser.add_argument("--pendentes", default=PASTA_PENDENTES, help="Pasta de pendentes")
+    parser.add_argument("--processed", default=PASTA_PROCESSADOS, help="Pasta de processados (arquivo original)")
+    parser.add_argument("--disposition", default=INPUT_DISPOSITION, choices=["move","delete","keep"],
+                        help="O que fazer com a entrada após processar")
     args = parser.parse_args()
 
-    PASTA_ENTRADAS  = args.input
-    PASTA_SAIDA     = args.output
-    PASTA_PENDENTES = args.pendentes
-    for pasta in (PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES):
+    PASTA_ENTRADAS      = args.input
+    PASTA_SAIDA         = args.output
+    PASTA_PENDENTES     = args.pendentes
+    PASTA_PROCESSADOS   = args.processed
+    INPUT_DISPOSITION   = args.disposition
+    for pasta in (PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES, PASTA_PROCESSADOS):
         os.makedirs(pasta, exist_ok=True)
 
     processar()
