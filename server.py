@@ -40,6 +40,9 @@ TWILIO_SID    = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_FROM   = os.getenv("TWILIO_WHATSAPP_FROM")  # ex: whatsapp:+14155238886
 
+# Base pública para montar links (opcional, mas recomendado)
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+
 # Limpeza pós-envio
 DELETE_OUTPUT_AFTER_SEND = (os.getenv("DELETE_OUTPUT_AFTER_SEND", "true").lower() == "true")
 DELETE_DELAY_SECONDS     = int(os.getenv("DELETE_DELAY_SECONDS", "180"))
@@ -49,6 +52,16 @@ app = Flask(__name__)  # server:app
 @app.get("/health")
 def health():
     return {"status": "ok"}, 200
+
+# -------- Util: base URL pública (força HTTPS em Railway) ----------
+def _compute_base_url(req):
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    root = (req.url_root or "").strip().rstrip("/")
+    # Corrige quando o proxy repassa como http no header
+    if root.startswith("http://") and ".railway.app" in root:
+        root = "https://" + root[len("http://"):]
+    return root
 
 # -------- Listagem / Download ----------
 @app.get("/files")
@@ -66,23 +79,26 @@ def list_files():
 
 @app.get("/files/renomeados/<path:fname>")
 def download_renomeado(fname):
-    return send_from_directory(OUTPUT_DIR, fname, as_attachment=True)
+    # Garante Content-Type correto
+    return send_from_directory(OUTPUT_DIR, fname, as_attachment=True, mimetype="application/pdf")
 
 @app.get("/files/pendentes/<path:fname>")
 def download_pendente(fname):
-    return send_from_directory(PENDENTES_DIR, fname, as_attachment=True)
+    return send_from_directory(PENDENTES_DIR, fname, as_attachment=True, mimetype="application/pdf")
 
 # -------- Envio WhatsApp ----------
 def _send_media_whatsapp(urls, to_number):
     client = Client(TWILIO_SID, TWILIO_TOKEN)
     first = True
     for u in urls:
-        client.messages.create(
-            from_=TWILIO_FROM,
-            to=to_number,
-            body="✅ Processado. Segue o PDF." if first else None,
-            media_url=[u],
-        )
+        params = {
+            "from_": TWILIO_FROM,
+            "to": to_number,
+            "media_url": [u],  # <<< anexo real
+        }
+        if first:
+            params["body"] = "✅ Processado. Segue o PDF."
+        client.messages.create(**params)
         first = False
 
 def _safe_remove(path):
@@ -108,8 +124,9 @@ def _processar_e_notificar(salvos, to_number, base_url):
     try:
         # Processa APENAS os PDFs deste webhook e pega a lista de saídas (basenames)
         caminhos_abs = [os.path.join(INPUT_DIR, n) for n in salvos]
-        basenames = proc.processar_arquivos(caminhos_abs)  # <<<<<< chave da mudança
+        basenames = proc.processar_arquivos(caminhos_abs)
 
+        # Sempre HTTPS (base_url já corrigida; reforçando aqui)
         links = [f"{base_url}/files/renomeados/{b}" for b in basenames]
         paths_abs = [os.path.join(OUTPUT_DIR, b) for b in basenames]
 
@@ -146,7 +163,7 @@ def whatsapp_webhook():
     if num_media <= 0:
         return Response("Envie um PDF do CT-e.", 200)
 
-    base_url = request.url_root.rstrip("/")
+    base_url = _compute_base_url(request)  # <<< base corrigida/https
 
     salvos = []
     for i in range(num_media):
