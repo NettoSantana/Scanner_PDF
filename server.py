@@ -39,7 +39,11 @@ os.makedirs(PENDENTES_DIR, exist_ok=True)
 # Credenciais Twilio
 TWILIO_SID    = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_FROM   = os.getenv("TWILIO_WHATSAPP_FROM")  # ex: whatsapp:+14155238886 ou whatsapp:+55SEU_NUMERO
+TWILIO_FROM   = os.getenv("TWILIO_WHATSAPP_FROM")  # ex: whatsapp:+14155238886
+
+# Limpeza pós-envio (padrão: apagar depois de 180s)
+DELETE_OUTPUT_AFTER_SEND = (os.getenv("DELETE_OUTPUT_AFTER_SEND", "true").lower() == "true")
+DELETE_DELAY_SECONDS     = int(os.getenv("DELETE_DELAY_SECONDS", "180"))
 
 app = Flask(__name__)  # server:app
 
@@ -83,6 +87,25 @@ def _send_media_whatsapp(urls, to_number: str):
         )
         first = False
 
+def _safe_remove(path: str):
+    try:
+        os.remove(path)
+        print(f"🧹 Removido: {path}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"⚠️ Erro ao remover {path}: {e}")
+
+def _schedule_delete(paths: list[str], delay: int):
+    def _job():
+        for p in paths:
+            absp = os.path.abspath(p)
+            # só remove o que estiver nas pastas de saída/pendentes
+            if absp.startswith(os.path.abspath(OUTPUT_DIR)) or absp.startswith(os.path.abspath(PENDENTES_DIR)):
+                _safe_remove(absp)
+    threading.Timer(delay, _job).start()
+    print(f"⏳ Limpeza agendada em {delay}s para {len(paths)} arquivo(s).")
+
 # -------- Worker: processa e responde por WhatsApp ----------
 def _processar_e_notificar(salvos, to_number: str, base_url: str):
     try:
@@ -97,13 +120,17 @@ def _processar_e_notificar(salvos, to_number: str, base_url: str):
         novos = sorted(after - before)
 
         links = [f"{base_url}/files/renomeados/{f}" for f in novos]
+        paths_abs = [os.path.join(OUTPUT_DIR, f) for f in novos]
 
         if links and TWILIO_SID and TWILIO_TOKEN and TWILIO_FROM and to_number:
             try:
                 _send_media_whatsapp(links, to_number)
                 print(f"📤 WhatsApp enviado para {to_number} com {len(links)} arquivo(s).")
+                if DELETE_OUTPUT_AFTER_SEND and paths_abs:
+                    _schedule_delete(paths_abs, DELETE_DELAY_SECONDS)
             except Exception as e:
-                print(f"⚠️ Erro ao enviar mídias: {e}. Enviando links em texto…")
+                print(f"⚠️ Erro ao enviar mídias: {e}. Não vou apagar os arquivos.")
+                # fallback texto (não apaga, pra não quebrar link)
                 try:
                     client = Client(TWILIO_SID, TWILIO_TOKEN)
                     chunk = links[:10]
@@ -117,7 +144,7 @@ def _processar_e_notificar(salvos, to_number: str, base_url: str):
             if not links:
                 print("ℹ️ Nada novo para enviar por WhatsApp (sem arquivos gerados).")
             else:
-                print("ℹ️ Variáveis TWILIO_* ausentes; pulo resposta pelo WhatsApp.")
+                print("ℹ️ Variáveis TWILIO_* ausentes; não apago arquivos.")
     except Exception as e:
         print(f"⚠️ Falha no worker de processamento/notificação: {e}")
 
