@@ -69,14 +69,7 @@ def download_renomeado(fname):
 def download_pendente(fname):
     return send_from_directory(PENDENTES_DIR, fname, as_attachment=True)
 
-# -------- Worker: processa e RESPONDE com ANEXOS no WhatsApp ----------
-def _links_por_prefixo(base_url: str, prefixo: str):
-    files = sorted(
-        f for f in os.listdir(OUTPUT_DIR)
-        if f.lower().endswith(".pdf") and f.startswith(prefixo + "__")
-    )
-    return [f"{base_url}/files/renomeados/{f}" for f in files]
-
+# -------- Envio WhatsApp ----------
 def _send_media_whatsapp(urls, to_number: str):
     # Envia 1 PDF por mensagem (mais estável no WhatsApp/Twilio)
     client = Client(TWILIO_SID, TWILIO_TOKEN)
@@ -90,14 +83,20 @@ def _send_media_whatsapp(urls, to_number: str):
         )
         first = False
 
+# -------- Worker: processa e responde por WhatsApp ----------
 def _processar_e_notificar(salvos, to_number: str, base_url: str):
     try:
-        proc.processar()  # processa tudo que está em INPUT_DIR
+        # snapshot antes de processar
+        before = set(f for f in os.listdir(OUTPUT_DIR) if f.lower().endswith(".pdf"))
 
-        links = []
-        for nome in salvos:
-            prefixo = os.path.splitext(nome)[0]
-            links.extend(_links_por_prefixo(base_url, prefixo))
+        # processa tudo que está em INPUT_DIR (gera arquivos NOVOS sem prefixo)
+        proc.processar()
+
+        # diff: arquivos novos gerados
+        after = set(f for f in os.listdir(OUTPUT_DIR) if f.lower().endswith(".pdf"))
+        novos = sorted(after - before)
+
+        links = [f"{base_url}/files/renomeados/{f}" for f in novos]
 
         if links and TWILIO_SID and TWILIO_TOKEN and TWILIO_FROM and to_number:
             try:
@@ -116,7 +115,7 @@ def _processar_e_notificar(salvos, to_number: str, base_url: str):
                     print(f"⚠️ Falha também no fallback de links: {e2}")
         else:
             if not links:
-                print("ℹ️ Nada para enviar por WhatsApp (sem links).")
+                print("ℹ️ Nada novo para enviar por WhatsApp (sem arquivos gerados).")
             else:
                 print("ℹ️ Variáveis TWILIO_* ausentes; pulo resposta pelo WhatsApp.")
     except Exception as e:
