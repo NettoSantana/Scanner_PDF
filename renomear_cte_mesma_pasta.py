@@ -41,10 +41,19 @@ def _dirs_from_env():
     pendentes_dir  = os.getenv("PENDENTES_DIR",  os.path.join(base, "pendentes"))
     processed_dir  = os.getenv("PROCESSED_DIR",  os.path.join(base, "processados"))
     disposition    = os.getenv("INPUT_DISPOSITION", "move").lower()  # move | delete | keep
-    return input_dir, output_dir, pendentes_dir, processed_dir, disposition
+    overwrite_mode = os.getenv("OUTPUT_OVERWRITE", "skip").lower()   # skip | overwrite | unique
+    if overwrite_mode not in ("skip", "overwrite", "unique"):
+        overwrite_mode = "skip"
+    return input_dir, output_dir, pendentes_dir, processed_dir, disposition, overwrite_mode
 
 # Defaults quando importado (server/gunicorn)
-PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES, PASTA_PROCESSADOS, INPUT_DISPOSITION = _dirs_from_env()
+(PASTA_ENTRADAS,
+ PASTA_SAIDA,
+ PASTA_PENDENTES,
+ PASTA_PROCESSADOS,
+ INPUT_DISPOSITION,
+ OUTPUT_OVERWRITE) = _dirs_from_env()
+
 for pasta in (PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES, PASTA_PROCESSADOS):
     os.makedirs(pasta, exist_ok=True)
 
@@ -53,6 +62,7 @@ print("📂 PASTA_SAIDA:", PASTA_SAIDA)
 print("📂 PASTA_PENDENTES:", PASTA_PENDENTES)
 print("📦 PASTA_PROCESSADOS:", PASTA_PROCESSADOS)
 print("⚙️ INPUT_DISPOSITION:", INPUT_DISPOSITION)
+print("📝 OUTPUT_OVERWRITE:", OUTPUT_OVERWRITE)
 
 # ================== Utilidades ==================
 def remover_acentos(s: str) -> str:
@@ -76,6 +86,22 @@ def nome_unico(caminho_base: str) -> str:
         if not os.path.exists(candidato):
             return candidato
         i += 1
+
+def decidir_destino(caminho_base: str) -> str or None:
+    """
+    Aplica OUTPUT_OVERWRITE:
+      - skip: se existir, não cria outro (retorna None para pular)
+      - overwrite: usa exatamente caminho_base (substitui se existir)
+      - unique: mantém comportamento antigo e gera __1, __2, ...
+    """
+    mode = OUTPUT_OVERWRITE
+    if mode == "skip" and os.path.exists(caminho_base):
+        print(f"⏭️  Saída já existe, pulando: {os.path.basename(caminho_base)}")
+        return None
+    if mode == "overwrite":
+        return caminho_base
+    # unique
+    return nome_unico(caminho_base)
 
 def identificar_tipo(texto: str) -> str:
     up = (texto or "").upper()
@@ -109,7 +135,6 @@ def _dispor_entrada(caminho_pdf: str):
         elif INPUT_DISPOSITION == "move":
             os.makedirs(PASTA_PROCESSADOS, exist_ok=True)
             destino = os.path.join(PASTA_PROCESSADOS, os.path.basename(caminho_pdf))
-            # evita overwrite do arquivo de entrada arquivado
             if os.path.exists(destino):
                 base, ext = os.path.splitext(destino)
                 k = 1
@@ -158,14 +183,14 @@ def processar_pdf(caminho_pdf: str):
                 # Nome final SEM prefixo zap_...__
                 nome_final = f"{slugify(nome_emissor)}_{tipo_doc}_{numero_doc}.pdf"
 
+                base_saida = (PASTA_SAIDA if (tipo_doc == "CTE" and modelo_usado) else PASTA_PENDENTES)
+                destino_candidato = os.path.join(base_saida, nome_final)
+                destino = decidir_destino(destino_candidato)
+                if destino is None:
+                    continue  # já existe e modo=skip
+
                 nova_doc = fitz.open()
                 nova_doc.insert_pdf(doc, from_page=i, to_page=i)
-
-                if tipo_doc == "CTE" and modelo_usado:
-                    destino = nome_unico(os.path.join(PASTA_SAIDA, nome_final))
-                else:
-                    destino = nome_unico(os.path.join(PASTA_PENDENTES, nome_final))
-
                 nova_doc.save(destino, deflate=True, garbage=4)
                 nova_doc.close()
 
@@ -187,9 +212,15 @@ def processar_pdf(caminho_pdf: str):
 
 def processar_arquivos(caminhos: list):
     """Processa somente os PDFs informados (para uso pelo server)."""
+    # evita duplicatas na lista de entrada mantendo ordem
+    vistos = set()
+    ordered_unique = []
     for c in caminhos:
-        if c and c.lower().endswith(".pdf") and os.path.exists(c):
-            processar_pdf(c)
+        if c and c.lower().endswith(".pdf") and os.path.exists(c) and c not in vistos:
+            ordered_unique.append(c)
+            vistos.add(c)
+    for c in ordered_unique:
+        processar_pdf(c)
 
 def processar():
     """Processa TUDO que estiver em PASTA_ENTRADAS (modo legado/CLI)."""
@@ -203,12 +234,14 @@ def processar():
 # ================== Execução via CLI ==================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Processa PDFs e renomeia por tipo/emissor/número.")
-    parser.add_argument("--input",     default=PASTA_ENTRADAS,  help="Pasta de entrada")
-    parser.add_argument("--output",    default=PASTA_SAIDA,     help="Pasta de saída OK")
-    parser.add_argument("--pendentes", default=PASTA_PENDENTES, help="Pasta de pendentes")
+    parser.add_argument("--input",     default=PASTA_ENTRADAS,   help="Pasta de entrada")
+    parser.add_argument("--output",    default=PASTA_SAIDA,      help="Pasta de saída OK")
+    parser.add_argument("--pendentes", default=PASTA_PENDENTES,  help="Pasta de pendentes")
     parser.add_argument("--processed", default=PASTA_PROCESSADOS, help="Pasta de processados (arquivo original)")
     parser.add_argument("--disposition", default=INPUT_DISPOSITION, choices=["move","delete","keep"],
                         help="O que fazer com a entrada após processar")
+    parser.add_argument("--overwrite", default=OUTPUT_OVERWRITE, choices=["skip","overwrite","unique"],
+                        help="Política de escrita da saída (duplicatas)")
     args = parser.parse_args()
 
     PASTA_ENTRADAS      = args.input
@@ -216,6 +249,7 @@ if __name__ == "__main__":
     PASTA_PENDENTES     = args.pendentes
     PASTA_PROCESSADOS   = args.processed
     INPUT_DISPOSITION   = args.disposition
+    OUTPUT_OVERWRITE    = args.overwrite
     for pasta in (PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES, PASTA_PROCESSADOS):
         os.makedirs(pasta, exist_ok=True)
 
