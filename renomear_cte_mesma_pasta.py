@@ -41,9 +41,7 @@ def _dirs_from_env():
     pendentes_dir  = os.getenv("PENDENTES_DIR",  os.path.join(base, "pendentes"))
     processed_dir  = os.getenv("PROCESSED_DIR",  os.path.join(base, "processados"))
     disposition    = os.getenv("INPUT_DISPOSITION", "move").lower()  # move | delete | keep
-    overwrite_mode = os.getenv("OUTPUT_OVERWRITE", "skip").lower()   # skip | overwrite | unique
-    if overwrite_mode not in ("skip", "overwrite", "unique"):
-        overwrite_mode = "skip"
+    overwrite_mode = os.getenv("OUTPUT_OVERWRITE",  "skip").lower()  # skip | replace
     return input_dir, output_dir, pendentes_dir, processed_dir, disposition, overwrite_mode
 
 # Defaults quando importado (server/gunicorn)
@@ -61,8 +59,8 @@ print("🔧 PASTA_ENTRADAS:", PASTA_ENTRADAS)
 print("📂 PASTA_SAIDA:", PASTA_SAIDA)
 print("📂 PASTA_PENDENTES:", PASTA_PENDENTES)
 print("📦 PASTA_PROCESSADOS:", PASTA_PROCESSADOS)
-print("⚙️ INPUT_DISPOSITION:", INPUT_DISPOSITION)
 print("📝 OUTPUT_OVERWRITE:", OUTPUT_OVERWRITE)
+print("⚙️ INPUT_DISPOSITION:", INPUT_DISPOSITION)
 
 # ================== Utilidades ==================
 def remover_acentos(s: str) -> str:
@@ -87,22 +85,6 @@ def nome_unico(caminho_base: str) -> str:
             return candidato
         i += 1
 
-def decidir_destino(caminho_base: str) -> str or None:
-    """
-    Aplica OUTPUT_OVERWRITE:
-      - skip: se existir, não cria outro (retorna None para pular)
-      - overwrite: usa exatamente caminho_base (substitui se existir)
-      - unique: mantém comportamento antigo e gera __1, __2, ...
-    """
-    mode = OUTPUT_OVERWRITE
-    if mode == "skip" and os.path.exists(caminho_base):
-        print(f"⏭️  Saída já existe, pulando: {os.path.basename(caminho_base)}")
-        return None
-    if mode == "overwrite":
-        return caminho_base
-    # unique
-    return nome_unico(caminho_base)
-
 def identificar_tipo(texto: str) -> str:
     up = (texto or "").upper()
     if ("CONHECIMENTO DE TRANSPORTE ELETRÔNICO" in up) or ("DACTE" in up):
@@ -125,9 +107,8 @@ MODELOS = {
     },
 }
 
-# ================== Processamento ==================
+# ================== Disposição da entrada ==================
 def _dispor_entrada(caminho_pdf: str):
-    """Após processar, decide o que fazer com o PDF de entrada para evitar reprocesso."""
     try:
         if INPUT_DISPOSITION == "delete":
             os.remove(caminho_pdf)
@@ -144,18 +125,21 @@ def _dispor_entrada(caminho_pdf: str):
             shutil.move(caminho_pdf, destino)
             print(f"📦 Entrada arquivada em: {destino}")
         else:
-            print("ℹ️ INPUT_DISPOSITION=keep — mantendo entradas (pode reprocessar em futuras chamadas).")
+            print("ℹ️ INPUT_DISPOSITION=keep — mantendo entradas (pode reprocessar).")
     except Exception as e:
         print(f"⚠️ Falha ao dispor entrada: {e}")
 
+# ================== Processamento ==================
 def processar_pdf(caminho_pdf: str):
+    """Processa 1 PDF e retorna uma lista de BASENAMES criados/identificados em PASTA_SAIDA (CT-e)."""
     print(f"\n📄 Processando: {os.path.basename(caminho_pdf)}")
+    saidas_cte = []
 
     try:
         doc = fitz.open(caminho_pdf)
     except Exception as e:
         print(f"⚠️ Erro ao abrir PDF '{caminho_pdf}': {e}")
-        return
+        return saidas_cte
 
     try:
         for i in range(doc.page_count):
@@ -180,23 +164,34 @@ def processar_pdf(caminho_pdf: str):
                                 numero_doc = m_num.group(1)
                             break
 
-                # Nome final SEM prefixo zap_...__
                 nome_final = f"{slugify(nome_emissor)}_{tipo_doc}_{numero_doc}.pdf"
-
-                base_saida = (PASTA_SAIDA if (tipo_doc == "CTE" and modelo_usado) else PASTA_PENDENTES)
-                destino_candidato = os.path.join(base_saida, nome_final)
-                destino = decidir_destino(destino_candidato)
-                if destino is None:
-                    continue  # já existe e modo=skip
-
-                nova_doc = fitz.open()
-                nova_doc.insert_pdf(doc, from_page=i, to_page=i)
-                nova_doc.save(destino, deflate=True, garbage=4)
-                nova_doc.close()
+                destino = os.path.join(
+                    (PASTA_SAIDA if (tipo_doc == "CTE" and modelo_usado) else PASTA_PENDENTES),
+                    nome_final
+                )
 
                 if tipo_doc == "CTE" and modelo_usado:
-                    print(f"✅ Página {i+1} ({modelo_usado}) salva: {os.path.basename(destino)}")
+                    # Política de overwrite
+                    if os.path.exists(destino) and OUTPUT_OVERWRITE == "skip":
+                        print(f"⏭️  Saída já existe, pulando: {os.path.basename(destino)}")
+                        saidas_cte.append(os.path.basename(destino))  # ainda assim reporta para envio
+                    else:
+                        nova_doc = fitz.open()
+                        nova_doc.insert_pdf(doc, from_page=i, to_page=i)
+                        # se "replace", sobrescreve; se "skip", não chega aqui; se não existir, cria
+                        if OUTPUT_OVERWRITE == "replace" and os.path.exists(destino):
+                            pass  # sobrescreve na mesma rota
+                        nova_doc.save(destino, deflate=True, garbage=4)
+                        nova_doc.close()
+                        print(f"✅ Página {i+1} ({modelo_usado}) salva: {os.path.basename(destino)}")
+                        saidas_cte.append(os.path.basename(destino))
                 else:
+                    # pendentes
+                    if not os.path.exists(destino):
+                        nova_doc = fitz.open()
+                        nova_doc.insert_pdf(doc, from_page=i, to_page=i)
+                        nova_doc.save(destino, deflate=True, garbage=4)
+                        nova_doc.close()
                     print(f"➜ Página {i+1} movida para pendentes: {os.path.basename(destino)}")
 
             except Exception as e_pag:
@@ -207,23 +202,20 @@ def processar_pdf(caminho_pdf: str):
         except Exception:
             pass
 
-    # Dispor a entrada para não reprocessar em chamadas futuras
     _dispor_entrada(caminho_pdf)
+    return saidas_cte
 
 def processar_arquivos(caminhos: list):
-    """Processa somente os PDFs informados (para uso pelo server)."""
-    # evita duplicatas na lista de entrada mantendo ordem
-    vistos = set()
-    ordered_unique = []
+    """Processa SOMENTE os PDFs informados.
+       Retorna lista de basenames na pasta de saída (CT-e), incluindo os já existentes quando OUTPUT_OVERWRITE=skip."""
+    out = []
     for c in caminhos:
-        if c and c.lower().endswith(".pdf") and os.path.exists(c) and c not in vistos:
-            ordered_unique.append(c)
-            vistos.add(c)
-    for c in ordered_unique:
-        processar_pdf(c)
+        if c and c.lower().endswith(".pdf") and os.path.exists(c):
+            out.extend(processar_pdf(c))
+    return out
 
 def processar():
-    """Processa TUDO que estiver em PASTA_ENTRADAS (modo legado/CLI)."""
+    """Processa TUDO que estiver em PASTA_ENTRADAS (modo CLI)."""
     arquivos = [f for f in os.listdir(PASTA_ENTRADAS) if f.lower().endswith(".pdf")]
     if not arquivos:
         print("ℹ️ Nenhum PDF em", PASTA_ENTRADAS)
@@ -240,8 +232,8 @@ if __name__ == "__main__":
     parser.add_argument("--processed", default=PASTA_PROCESSADOS, help="Pasta de processados (arquivo original)")
     parser.add_argument("--disposition", default=INPUT_DISPOSITION, choices=["move","delete","keep"],
                         help="O que fazer com a entrada após processar")
-    parser.add_argument("--overwrite", default=OUTPUT_OVERWRITE, choices=["skip","overwrite","unique"],
-                        help="Política de escrita da saída (duplicatas)")
+    parser.add_argument("--overwrite", default=OUTPUT_OVERWRITE, choices=["skip","replace"],
+                        help="Se arquivo de saída já existir: skip (pula) ou replace (sobrescreve)")
     args = parser.parse_args()
 
     PASTA_ENTRADAS      = args.input
@@ -250,6 +242,7 @@ if __name__ == "__main__":
     PASTA_PROCESSADOS   = args.processed
     INPUT_DISPOSITION   = args.disposition
     OUTPUT_OVERWRITE    = args.overwrite
+
     for pasta in (PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES, PASTA_PROCESSADOS):
         os.makedirs(pasta, exist_ok=True)
 

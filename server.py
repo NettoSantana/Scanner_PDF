@@ -5,7 +5,6 @@ from datetime import datetime
 from flask import Flask, request, Response, send_from_directory, jsonify
 from dotenv import load_dotenv
 import requests
-from typing import List  # <<< Python 3.8: usar List
 
 # processamento
 import renomear_cte_mesma_pasta as proc
@@ -15,7 +14,6 @@ from twilio.rest import Client
 
 load_dotenv()
 
-# Pastas (se houver /data montado e vars não setadas, usa /data)
 def _default_dir(env_name, fallback):
     v = os.getenv(env_name)
     if v:
@@ -42,7 +40,7 @@ TWILIO_SID    = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_FROM   = os.getenv("TWILIO_WHATSAPP_FROM")  # ex: whatsapp:+14155238886
 
-# Limpeza pós-envio (padrão: apagar depois de 180s)
+# Limpeza pós-envio
 DELETE_OUTPUT_AFTER_SEND = (os.getenv("DELETE_OUTPUT_AFTER_SEND", "true").lower() == "true")
 DELETE_DELAY_SECONDS     = int(os.getenv("DELETE_DELAY_SECONDS", "180"))
 
@@ -75,8 +73,7 @@ def download_pendente(fname):
     return send_from_directory(PENDENTES_DIR, fname, as_attachment=True)
 
 # -------- Envio WhatsApp ----------
-def _send_media_whatsapp(urls, to_number: str):
-    # Envia 1 PDF por mensagem (mais estável no WhatsApp/Twilio)
+def _send_media_whatsapp(urls, to_number):
     client = Client(TWILIO_SID, TWILIO_TOKEN)
     first = True
     for u in urls:
@@ -84,11 +81,11 @@ def _send_media_whatsapp(urls, to_number: str):
             from_=TWILIO_FROM,
             to=to_number,
             body="✅ Processado. Segue o PDF." if first else None,
-            media_url=[u],  # exatamente 1 mídia por mensagem
+            media_url=[u],
         )
         first = False
 
-def _safe_remove(path: str):
+def _safe_remove(path):
     try:
         os.remove(path)
         print(f"🧹 Removido: {path}")
@@ -97,31 +94,24 @@ def _safe_remove(path: str):
     except Exception as e:
         print(f"⚠️ Erro ao remover {path}: {e}")
 
-def _schedule_delete(paths: List[str], delay: int):  # <<< aqui
+def _schedule_delete(paths, delay):
     def _job():
         for p in paths:
             absp = os.path.abspath(p)
-            # só remove o que estiver nas pastas de saída/pendentes
             if absp.startswith(os.path.abspath(OUTPUT_DIR)) or absp.startswith(os.path.abspath(PENDENTES_DIR)):
                 _safe_remove(absp)
     threading.Timer(delay, _job).start()
     print(f"⏳ Limpeza agendada em {delay}s para {len(paths)} arquivo(s).")
 
 # -------- Worker: processa e responde por WhatsApp ----------
-def _processar_e_notificar(salvos, to_number: str, base_url: str):
+def _processar_e_notificar(salvos, to_number, base_url):
     try:
-        # snapshot antes de processar
-        before = set(f for f in os.listdir(OUTPUT_DIR) if f.lower().endswith(".pdf"))
+        # Processa APENAS os PDFs deste webhook e pega a lista de saídas (basenames)
+        caminhos_abs = [os.path.join(INPUT_DIR, n) for n in salvos]
+        basenames = proc.processar_arquivos(caminhos_abs)  # <<<<<< chave da mudança
 
-        # processa tudo que está em INPUT_DIR (gera arquivos NOVOS sem prefixo)
-        proc.processar()
-
-        # diff: arquivos novos gerados
-        after = set(f for f in os.listdir(OUTPUT_DIR) if f.lower().endswith(".pdf"))
-        novos = sorted(after - before)
-
-        links = [f"{base_url}/files/renomeados/{f}" for f in novos]
-        paths_abs = [os.path.join(OUTPUT_DIR, f) for f in novos]
+        links = [f"{base_url}/files/renomeados/{b}" for b in basenames]
+        paths_abs = [os.path.join(OUTPUT_DIR, b) for b in basenames]
 
         if links and TWILIO_SID and TWILIO_TOKEN and TWILIO_FROM and to_number:
             try:
@@ -130,8 +120,7 @@ def _processar_e_notificar(salvos, to_number: str, base_url: str):
                 if DELETE_OUTPUT_AFTER_SEND and paths_abs:
                     _schedule_delete(paths_abs, DELETE_DELAY_SECONDS)
             except Exception as e:
-                print(f"⚠️ Erro ao enviar mídias: {e}. Não vou apagar os arquivos.")
-                # fallback texto (não apaga, pra não quebrar link)
+                print(f"⚠️ Erro ao enviar mídias: {e}. Enviando links em texto…")
                 try:
                     client = Client(TWILIO_SID, TWILIO_TOKEN)
                     chunk = links[:10]
@@ -143,7 +132,7 @@ def _processar_e_notificar(salvos, to_number: str, base_url: str):
                     print(f"⚠️ Falha também no fallback de links: {e2}")
         else:
             if not links:
-                print("ℹ️ Nada novo para enviar por WhatsApp (sem arquivos gerados).")
+                print("ℹ️ Nada novo para enviar por WhatsApp (sem arquivos gerados/identificados).")
             else:
                 print("ℹ️ Variáveis TWILIO_* ausentes; não apago arquivos.")
     except Exception as e:
@@ -154,7 +143,6 @@ def _processar_e_notificar(salvos, to_number: str, base_url: str):
 def whatsapp_webhook():
     from_number = request.form.get("From", "")
     num_media = int(request.form.get("NumMedia", "0") or 0)
-
     if num_media <= 0:
         return Response("Envie um PDF do CT-e.", 200)
 
