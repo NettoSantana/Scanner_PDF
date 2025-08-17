@@ -20,7 +20,6 @@ def _default_dir(env_name, fallback):
     if v:
         return v
     if os.path.isdir("/data"):
-        # se volume existir, usa-o por padrão
         mapping = {
             "INPUT_DIR": "/data/entradas",
             "OUTPUT_DIR": "/data/renomeados",
@@ -42,7 +41,7 @@ TWILIO_SID    = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_FROM   = os.getenv("TWILIO_WHATSAPP_FROM")  # ex: whatsapp:+14155238886 ou whatsapp:+55SEU_NUMERO
 
-app = Flask(__name__)  # <<< ISSO É O QUE O GUNICORN PROCURA (server:app)
+app = Flask(__name__)  # server:app
 
 @app.get("/health")
 def health():
@@ -79,15 +78,17 @@ def _links_por_prefixo(base_url: str, prefixo: str):
     return [f"{base_url}/files/renomeados/{f}" for f in files]
 
 def _send_media_whatsapp(urls, to_number: str):
+    # Envia 1 PDF por mensagem (mais estável no WhatsApp/Twilio)
     client = Client(TWILIO_SID, TWILIO_TOKEN)
-    for i in range(0, len(urls), 10):  # Twilio: até 10 mídias por mensagem
-        chunk = urls[i:i+10]
+    first = True
+    for u in urls:
         client.messages.create(
             from_=TWILIO_FROM,
             to=to_number,
-            body="✅ Processado. Seguem os PDFs." if i == 0 else None,
-            media_url=chunk,
+            body="✅ Processado. Segue o PDF." if first else None,
+            media_url=[u],  # exatamente 1 mídia por mensagem
         )
+        first = False
 
 def _processar_e_notificar(salvos, to_number: str, base_url: str):
     try:
@@ -101,7 +102,7 @@ def _processar_e_notificar(salvos, to_number: str, base_url: str):
         if links and TWILIO_SID and TWILIO_TOKEN and TWILIO_FROM and to_number:
             try:
                 _send_media_whatsapp(links, to_number)
-                print(f"📤 WhatsApp enviado para {to_number} com {len(links)} anexo(s).")
+                print(f"📤 WhatsApp enviado para {to_number} com {len(links)} arquivo(s).")
             except Exception as e:
                 print(f"⚠️ Erro ao enviar mídias: {e}. Enviando links em texto…")
                 try:
@@ -130,7 +131,7 @@ def whatsapp_webhook():
     if num_media <= 0:
         return Response("Envie um PDF do CT-e.", 200)
 
-    base_url = request.url_root.rstrip("/")  # URL pública base
+    base_url = request.url_root.rstrip("/")
 
     salvos = []
     for i in range(num_media):
