@@ -53,17 +53,14 @@ app = Flask(__name__)  # server:app
 def health():
     return {"status": "ok"}, 200
 
-# -------- Util: base URL pública (força HTTPS em Railway) ----------
 def _compute_base_url(req):
     if PUBLIC_BASE_URL:
         return PUBLIC_BASE_URL
     root = (req.url_root or "").strip().rstrip("/")
-    # Corrige quando o proxy repassa como http no header
     if root.startswith("http://") and ".railway.app" in root:
         root = "https://" + root[len("http://"):]
     return root
 
-# -------- Listagem / Download ----------
 @app.get("/files")
 def list_files():
     out_files = sorted([f for f in os.listdir(OUTPUT_DIR) if f.lower().endswith(".pdf")])
@@ -79,23 +76,17 @@ def list_files():
 
 @app.get("/files/renomeados/<path:fname>")
 def download_renomeado(fname):
-    # Garante Content-Type correto
     return send_from_directory(OUTPUT_DIR, fname, as_attachment=True, mimetype="application/pdf")
 
 @app.get("/files/pendentes/<path:fname>")
 def download_pendente(fname):
     return send_from_directory(PENDENTES_DIR, fname, as_attachment=True, mimetype="application/pdf")
 
-# -------- Envio WhatsApp ----------
 def _send_media_whatsapp(urls, to_number):
     client = Client(TWILIO_SID, TWILIO_TOKEN)
     first = True
     for u in urls:
-        params = {
-            "from_": TWILIO_FROM,
-            "to": to_number,
-            "media_url": [u],  # <<< anexo real
-        }
+        params = {"from_": TWILIO_FROM, "to": to_number, "media_url": [u]}
         if first:
             params["body"] = "✅ Processado. Segue o PDF."
         client.messages.create(**params)
@@ -119,14 +110,11 @@ def _schedule_delete(paths, delay):
     threading.Timer(delay, _job).start()
     print(f"⏳ Limpeza agendada em {delay}s para {len(paths)} arquivo(s).")
 
-# -------- Worker: processa e responde por WhatsApp ----------
 def _processar_e_notificar(salvos, to_number, base_url):
     try:
-        # Processa APENAS os PDFs deste webhook e pega a lista de saídas (basenames)
         caminhos_abs = [os.path.join(INPUT_DIR, n) for n in salvos]
         basenames = proc.processar_arquivos(caminhos_abs)
 
-        # Sempre HTTPS (base_url já corrigida; reforçando aqui)
         links = [f"{base_url}/files/renomeados/{b}" for b in basenames]
         paths_abs = [os.path.join(OUTPUT_DIR, b) for b in basenames]
 
@@ -155,7 +143,6 @@ def _processar_e_notificar(salvos, to_number, base_url):
     except Exception as e:
         print(f"⚠️ Falha no worker de processamento/notificação: {e}")
 
-# -------- Webhook Twilio ----------
 @app.post("/whatsapp")
 def whatsapp_webhook():
     from_number = request.form.get("From", "")
@@ -163,7 +150,7 @@ def whatsapp_webhook():
     if num_media <= 0:
         return Response("Envie um PDF do CT-e.", 200)
 
-    base_url = _compute_base_url(request)  # <<< base corrigida/https
+    base_url = _compute_base_url(request)
 
     salvos = []
     for i in range(num_media):
@@ -171,7 +158,6 @@ def whatsapp_webhook():
         media_url    = request.form.get(f"MediaUrl{i}", "") or ""
         if "pdf" not in content_type or not media_url:
             continue
-
         try:
             auth = (TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
             with requests.get(media_url, stream=True, timeout=30, auth=auth) as r:
@@ -180,9 +166,8 @@ def whatsapp_webhook():
                 nome  = f"zap_{stamp}_{i+1}.pdf"
                 caminho = os.path.join(INPUT_DIR, nome)
                 with open(caminho, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
+                    for chunk in r.iterable:
+                        f.write(chunk)
                 salvos.append(nome)
                 print(f"📥 PDF salvo de {from_number}: {nome}")
         except Exception as e:

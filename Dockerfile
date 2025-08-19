@@ -1,3 +1,4 @@
+# Dockerfile
 # Base Ubuntu
 FROM ubuntu:20.04
 
@@ -5,11 +6,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Dependências do sistema (Poppler + ZBar + Python)
+# Dependências do sistema (Poppler + ZBar + Tesseract + Python)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       poppler-utils \
       libzbar0 \
+      tesseract-ocr \
+      tesseract-ocr-por \
       python3 python3-pip python3-venv && \
     rm -rf /var/lib/apt/lists/*
 
