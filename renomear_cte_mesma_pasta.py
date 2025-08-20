@@ -53,6 +53,8 @@ def _as_int(env, default):
     except Exception:
         return default
 OCR_DPI = _as_int("OCR_DPI", 300)
+FORCE_OCR = (os.getenv("FORCE_OCR", "false").lower() == "true")
+
 print("🔧 PASTA_ENTRADAS:", PASTA_ENTRADAS)
 print("📂 PASTA_SAIDA:", PASTA_SAIDA)
 print("📂 PASTA_PENDENTES:", PASTA_PENDENTES)
@@ -60,6 +62,7 @@ print("📦 PASTA_PROCESSADOS:", PASTA_PROCESSADOS)
 print("📝 OUTPUT_OVERWRITE:", OUTPUT_OVERWRITE)
 print("⚙️ INPUT_DISPOSITION:", INPUT_DISPOSITION)
 print("🖨️ OCR_DPI:", OCR_DPI)
+print("🧲 FORCE_OCR:", FORCE_OCR)
 
 # ===== Mapa CNPJ → Nome canônico =====
 def _load_cnpj_canon() -> Dict[str, str]:
@@ -196,8 +199,6 @@ def ocr_data(img: Image.Image) -> Dict[str, Any]:
         return {"text": [], "conf": [], "left": [], "top": [], "width": [], "height": [], "line_num": [], "block_num": [], "par_num": []}
 
 # ===== Heurísticas de nome do emissor com OCR-TSV =====
-NEG_TOKENS = NEG_TOKENS  # keep reference
-
 def _is_bad_line(s: str) -> bool:
     u = remover_acentos(s).upper()
     if sum(c.isdigit() for c in u) > max(2, len(u)//4):  # muita cifra => não é razão social
@@ -213,8 +214,6 @@ def _clean_company_line(s: str) -> str:
     s = re.split(cut_regex, remover_acentos(s), maxsplit=1, flags=re.I)[0]
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s
-
-PREF_TOKENS = PREF_TOKENS  # keep reference
 
 def _score_company_line(s: str) -> int:
     u = remover_acentos(s).upper()
@@ -340,22 +339,27 @@ def _dispor_entrada(caminho_pdf: str):
 
 # ===== Núcleo =====
 def extrair_meta_pagina(pagina: fitz.Page) -> Tuple[str, str, str]:
+    # 1) tenta texto embutido
     texto = pagina.get_text("text") or ""
     tipo_doc = identificar_tipo(texto)
+    has_text = bool(texto.strip())
     nome_emissor = "EMISSOR_DESCONHECIDO"
     numero_doc = "000"
 
-    # atalho: se tiver texto embutido e bater com modelos
-    if tipo_doc == "CTE" and texto:
+    print(f"🧭 Estratégia: has_text={has_text} force_ocr={FORCE_OCR}")
+
+    # Se houver texto embutido e bater com modelos, e NÃO estiver forçando OCR
+    if not FORCE_OCR and tipo_doc == "CTE" and has_text:
         for _, regras in MODELOS.items():
             if regras["regex_emissor"].search(texto):
                 m_emp = regras["regex_emissor"].search(texto)
                 if m_emp: nome_emissor = slugify(m_emp.group(1))
                 m_num = regras["regex_cte"].search(texto)
                 if m_num: numero_doc = str(int(m_num.group(1)))
+                print("→ Caminho: TEXT-EMBUTIDO/MODELO")
                 return ("CTE", nome_emissor, numero_doc)
 
-    # raster + QR
+    # 2) raster + QR
     img = page_to_pil(pagina, dpi=OCR_DPI)
     img_p = preprocess(img)
     chave = None
@@ -367,31 +371,33 @@ def extrair_meta_pagina(pagina: fitz.Page) -> Tuple[str, str, str]:
     if chave and nct:
         tipo_doc = "CTE"; numero_doc = nct
 
-    # OCR (texto e TSV)
+    # 3) OCR (texto + TSV)
     ocr = ocr_text(img_p)
     data = ocr_data(img_p)
     if tipo_doc == "DESCONHECIDO":
         tipo_doc = identificar_tipo(ocr)
 
-    # ---- Nome do emissor: prioriza CNPJ_CANON, senão OCR-TSV ----
+    # prioridade: mapa canônico por CNPJ
     nome_canon = CNPJ_CANON.get(cnpj14) if cnpj14 else None
     if nome_canon:
-        print(f"🔒 Nome canônico por CNPJ: {cnpj14} -> {nome_canon}")
         nome_guess = nome_canon
+        nome_src = "canon"
     else:
         nome_guess = guess_emissor_from_data(data, cnpj14) or ""
+        nome_src = "ocr-tsv"
         if not nome_guess and ocr:
-            # fallback simples: procura "CNPJ" e usa a linha de cima
+            # fallback simples: linha acima de "CNPJ"
             linhas = [l.strip() for l in ocr.splitlines() if l.strip()]
             for i,l in enumerate(linhas):
                 if "CNPJ" in remover_acentos(l).upper():
                     for j in range(max(0,i-3), i):
                         cand = _clean_company_line(linhas[j])
                         if cand and not _is_bad_line(cand):
-                            nome_guess = cand; break
+                            nome_guess = cand; nome_src = "ocr-text"; break
                     if nome_guess: break
 
     nome_emissor = slugify(nome_guess) if nome_guess else "EMISSOR_DESCONHECIDO"
+    print(f"→ Caminho: {'FORCED-OCR' if FORCE_OCR else ('OCR' if has_text else 'OCR')}; emissor={nome_emissor}; nCT={numero_doc}; fonte={nome_src}")
     return (tipo_doc, nome_emissor, numero_doc)
 
 def processar_pdf(caminho_pdf: str) -> List[str]:
