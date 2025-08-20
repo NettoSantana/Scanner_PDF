@@ -6,7 +6,6 @@ import shutil
 import unicodedata
 import subprocess
 import argparse
-import io
 from typing import Optional, Tuple, List
 import fitz  # PyMuPDF
 from PIL import Image
@@ -72,6 +71,16 @@ print("📝 OUTPUT_OVERWRITE:", OUTPUT_OVERWRITE)
 print("⚙️ INPUT_DISPOSITION:", INPUT_DISPOSITION)
 
 # ================== Utilidades ==================
+NEG_TOKENS = (
+    "CONHECIMENT", "DACTE", "CHAV", "ACESS", "PROTOC", "RECEIT", "FISCO",
+    "DESTINAT", "REMET", "TOMADOR", "AUTORIZA", "CONSULT", "QRCODE",
+    "MODELO", "SERIE", "SERlE", "NCT", "NUMERO", "NÚMERO"
+)
+PREF_TOKENS = (
+    " LTDA", " S/A", " SA ", " ME ", " EPP", " MEI", " TRANSPORT", " LOGIST",
+    " COMERC", " INDÚSTR", " INDUSTR", " SERVI", " DISTRIB"
+)
+
 def remover_acentos(s: str) -> str:
     if not s:
         return ""
@@ -96,15 +105,15 @@ def nome_unico(caminho_base: str) -> str:
 
 def identificar_tipo(texto: str) -> str:
     up = (texto or "").upper()
-    if ("CONHECIMENTO DE TRANSPORTE ELETRÔNICO" in up) or ("DACTE" in up):
+    if ("CONHECIMENTO DE TRANSPORTE ELETR" in up) or ("DACTE" in up):
         return "CTE"
-    if ("NOTA FISCAL ELETRÔNICA" in up) or ("NFS-E" in up) or ("NF-E" in up):
+    if ("NOTA FISCAL ELETR" in up) or ("NFS-E" in up) or ("NF-E" in up):
         return "NF"
-    if ("BOLETO" in up) or ("FICHA DE COMPENSAÇÃO" in up):
+    if ("BOLETO" in up) or ("FICHA DE COMPENSAC" in up):
         return "BOLETO"
     return "DESCONHECIDO"
 
-# Regex pré-compiladas (modelos específicos continuam valendo para PDFs com texto embutido)
+# Padrões existentes para PDFs com texto embutido
 MODELOS = {
     "WANDER_PEREIRA_DE_MATOS": {
         "regex_emissor": re.compile(r"\n([A-Z ]{5,})\s+CNPJ:\s*[\d./-]+\s+IE:", re.IGNORECASE),
@@ -128,12 +137,8 @@ def _digits_only(s: str) -> str:
     return re.sub(r"\D+", "", s or "")
 
 def parse_chave_acesso_from_payload(payload: str) -> Optional[str]:
-    """
-    Aceita: 44 dígitos diretos OU URL contendo ?p=... ou chNFe/chCTe/pChaveAcesso com 44 dígitos.
-    """
     if not payload:
         return None
-    # URL?
     try:
         u = urlparse(payload)
         if u.query:
@@ -145,7 +150,6 @@ def parse_chave_acesso_from_payload(payload: str) -> Optional[str]:
                         return d
     except Exception:
         pass
-    # Texto cru com 44 dígitos
     d = _digits_only(payload)
     m = re.search(r"(\d{44})", d)
     return m.group(1) if m else None
@@ -158,23 +162,18 @@ def decode_qr_from_image(img: Image.Image) -> List[str]:
         return []
 
 def nct_from_chave(chave44: str) -> Optional[str]:
-    """
-    Chave: cUF(2) AAMM(4) CNPJ(14) mod(2) série(3) nDoc(9) tpEmis(1) cNF(8) DV(1)
-    Para CT-e: mod=57 (CT-e) ou 67 (CT-e OS). Número = posições 26..34 (9 dígitos).
-    """
     if not chave44 or len(chave44) != 44 or not chave44.isdigit():
         return None
     mod = chave44[20:22]
     if mod not in ("57", "67"):
         return None
-    numero = chave44[25:34]  # zero-based
+    numero = chave44[25:34]
     return str(int(numero)) if numero.isdigit() else None
 
 def cnpj_from_chave(chave44: str) -> Optional[str]:
     if not chave44 or len(chave44) != 44 or not chave44.isdigit():
         return None
-    cnpj = chave44[6:20]
-    return cnpj
+    return chave44[6:20]
 
 def format_cnpj(cnpj14: str) -> str:
     if not cnpj14 or len(cnpj14) != 14:
@@ -182,7 +181,6 @@ def format_cnpj(cnpj14: str) -> str:
     return f"{cnpj14[0:2]}.{cnpj14[2:5]}.{cnpj14[5:8]}/{cnpj14[8:12]}-{cnpj14[12:14]}"
 
 def ocr_text(img: Image.Image) -> str:
-    # Modo rápido e robusto para caixa alta
     cfg = "--oem 1 --psm 6"
     try:
         return pytesseract.image_to_string(img, lang="por", config=cfg) or ""
@@ -192,28 +190,78 @@ def ocr_text(img: Image.Image) -> str:
         except Exception:
             return ""
 
-def guess_emissor(texto: str, cnpj14: Optional[str] = None) -> str:
-    up = (texto or "").upper()
-    nome = "EMISSOR_DESCONHECIDO"
-    # Se temos CNPJ, tente capturar a linha do nome próxima do CNPJ
+def _clean_company_line(s: str) -> str:
+    s = s.strip(" :.-\t")
+    # remove rótulos comuns
+    s = re.sub(r"^(RAZAO\s+SOCIAL|RAZAO|EMITENTE|EMISSOR|PRESTADOR.*?SERVI[ÇC]O|PRESTADOR)\s*[:\-]*\s*", "", s, flags=re.I)
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
+
+def _is_bad_line(s: str) -> bool:
+    us = remover_acentos(s).upper()
+    return any(tok in us for tok in NEG_TOKENS)
+
+def _score_company_line(s: str) -> int:
+    """Pontuação simples: favorece sufixos empresariais e linhas maiores."""
+    us = remover_acentos(s).upper()
+    score = len(us)
+    for t in PREF_TOKENS:
+        if t in us:
+            score += 20
+    if _is_bad_line(us):
+        score -= 50
+    return score
+
+def guess_emissor(ocr_texto: str, cnpj14: Optional[str] = None) -> str:
+    """
+    Estratégia:
+    1) Se temos CNPJ, pegar a(s) linha(s) ao redor do CNPJ.
+    2) Procurar blocos com EMITENTE/EMISSOR/PRESTADOR e pegar a próxima linha útil.
+    3) Fallback: melhor linha longa, filtrando tokens proibidos.
+    """
+    if not ocr_texto:
+        return "EMISSOR_DESCONHECIDO"
+
+    linhas = [l.strip() for l in ocr_texto.splitlines()]
+    linhas = [l for l in linhas if l and len(remover_acentos(l).strip()) >= 3]
+
+    # 1) CNPJ baseado na chave
     if cnpj14:
         cnpj_fmt = format_cnpj(cnpj14)
-        pads = [cnpj_fmt, cnpj14]
-        for needle in pads:
-            if not needle:
-                continue
-            # pega até 60 chars antes do CNPJ na mesma linha/bloco
-            m = re.search(rf"([A-Z0-9 .,&'\-]{{8,60}})\s*(?:CNPJ|CPF)?.{{0,10}}{re.escape(needle)}", up, re.MULTILINE)
-            if m:
-                nome = m.group(1)
-                break
-    if nome == "EMISSOR_DESCONHECIDO":
-        # fallback: primeira linha LONGA em caixa-alta sem palavras proibidas
-        linhas = [l.strip() for l in up.splitlines() if l.strip()]
-        linhas = [l for l in linhas if len(l) >= 8 and not any(w in l for w in ("CONHECIMENTO", "DACTE", "CHAVE", "ACESSO", "PROTOCOLO", "RECEITA", "FISCO", "DESTINAT", "REMET", "TOMADOR", "TRANSPORTE"))]
-        if linhas:
-            nome = linhas[0][:60]
-    return slugify(nome)
+        # Índices onde aparece CNPJ (formatado ou cru)
+        idxs = []
+        for i, l in enumerate(linhas):
+            lnum = _digits_only(l)
+            if cnpj14 in lnum or (cnpj_fmt and cnpj_fmt in remover_acentos(l)):
+                idxs.append(i)
+        for idx in idxs:
+            candidatos = []
+            for j in range(max(0, idx-2), idx+1):
+                if j == idx:
+                    continue
+                cand = _clean_company_line(linhas[j])
+                if cand and not _is_bad_line(cand):
+                    candidatos.append(cand)
+            if candidatos:
+                melhor = max(candidatos, key=_score_company_line)
+                return slugify(melhor)
+
+    # 2) Blocos por rótulo
+    for i, l in enumerate(linhas):
+        if re.search(r"\b(EMITENTE|EMISSOR|PRESTADOR)\b", remover_acentos(l), flags=re.I):
+            # próxima(s) linhas úteis
+            for j in range(i+1, min(i+4, len(linhas))):
+                cand = _clean_company_line(linhas[j])
+                if cand and not _is_bad_line(cand):
+                    return slugify(cand)
+
+    # 3) Fallback robusto: pegar melhor linha longa sem tokens ruins
+    candidatos = [ _clean_company_line(l) for l in linhas if not _is_bad_line(l) and len(l) >= 8 ]
+    if candidatos:
+        melhor = max(candidatos, key=_score_company_line)
+        return slugify(melhor)
+
+    return "EMISSOR_DESCONHECIDO"
 
 # ================== Disposição da entrada ==================
 def _dispor_entrada(caminho_pdf: str):
@@ -239,18 +287,13 @@ def _dispor_entrada(caminho_pdf: str):
 
 # ================== Núcleo: extrair metadados de 1 página ==================
 def extrair_meta_pagina(pagina: fitz.Page) -> Tuple[str, str, str]:
-    """
-    Retorna (tipo_doc, nome_emissor_slug, numero_doc)
-    tipo_doc ∈ {"CTE","NF","BOLETO","DESCONHECIDO"}
-    """
-    # 1) Texto embutido (quando existir)
     texto = pagina.get_text("text") or ""
     tipo_doc = identificar_tipo(texto)
 
     nome_emissor = "EMISSOR_DESCONHECIDO"
     numero_doc   = "000"
 
-    # Tenta primeiro pelos MODELOS conhecidos (rápido quando há texto embutido)
+    # Tenta padrões se houver texto embutido (rápido)
     if tipo_doc == "CTE" and texto:
         for modelo, regras in MODELOS.items():
             if regras["regex_emissor"].search(texto):
@@ -262,7 +305,7 @@ def extrair_meta_pagina(pagina: fitz.Page) -> Tuple[str, str, str]:
                     numero_doc = str(int(m_num.group(1)))
                 return ("CTE", nome_emissor, numero_doc)
 
-    # 2) Rasteriza a página e tenta QR/Barcode → chave de acesso
+    # Rasteriza + QR/Barcode
     img = page_to_pil(pagina, dpi=300)
     payloads = decode_qr_from_image(img)
     chave = None
@@ -275,21 +318,20 @@ def extrair_meta_pagina(pagina: fitz.Page) -> Tuple[str, str, str]:
     cnpj14 = cnpj_from_chave(chave) if chave else None
     nct    = nct_from_chave(chave) if chave else None
     if chave and nct:
-        tipo_doc = "CTE"  # mod 57/67 confirmado pela chave
+        tipo_doc = "CTE"
         numero_doc = nct
-    # 3) OCR como fallback (nome do emissor e/ou identificação do tipo)
+
+    # OCR
     ocr = ocr_text(img)
     if tipo_doc == "DESCONHECIDO":
         tipo_doc = identificar_tipo(ocr)
 
-    # nome emissor: preferir OCR, usando CNPJ quando existir
     nome_emissor = guess_emissor(ocr or texto, cnpj14) if (ocr or texto) else "EMISSOR_DESCONHECIDO"
 
     return (tipo_doc, nome_emissor, numero_doc)
 
 # ================== Processamento ==================
 def processar_pdf(caminho_pdf: str):
-    """Processa 1 PDF e retorna uma lista de BASENAMES criados/identificados em PASTA_SAIDA (CT-e)."""
     print(f"\n📄 Processando: {os.path.basename(caminho_pdf)}")
     saidas_cte = []
 
@@ -322,8 +364,6 @@ def processar_pdf(caminho_pdf: str):
 
                 nova_doc = fitz.open()
                 nova_doc.insert_pdf(doc, from_page=i, to_page=i)
-                if OUTPUT_OVERWRITE == "replace" and os.path.exists(destino):
-                    pass
                 nova_doc.save(destino, deflate=True, garbage=4)
                 nova_doc.close()
 
@@ -345,8 +385,6 @@ def processar_pdf(caminho_pdf: str):
     return saidas_cte
 
 def processar_arquivos(caminhos: list):
-    """Processa SOMENTE os PDFs informados.
-       Retorna lista de basenames na pasta de saída (CT-e), incluindo os já existentes quando OUTPUT_OVERWRITE=skip."""
     out = []
     for c in caminhos:
         if c and c.lower().endswith(".pdf") and os.path.exists(c):
@@ -354,7 +392,6 @@ def processar_arquivos(caminhos: list):
     return out
 
 def processar():
-    """Processa TUDO que estiver em PASTA_ENTRADAS (modo CLI)."""
     arquivos = [f for f in os.listdir(PASTA_ENTRADAS) if f.lower().endswith(".pdf")]
     if not arquivos:
         print("ℹ️ Nenhum PDF em", PASTA_ENTRADAS)
