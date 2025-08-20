@@ -166,8 +166,9 @@ def whatsapp_webhook():
                 nome  = f"zap_{stamp}_{i+1}.pdf"
                 caminho = os.path.join(INPUT_DIR, nome)
                 with open(caminho, "wb") as f:
-                    for chunk in r.iterable:
-                        f.write(chunk)
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
                 salvos.append(nome)
                 print(f"📥 PDF salvo de {from_number}: {nome}")
         except Exception as e:
