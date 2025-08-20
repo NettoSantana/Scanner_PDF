@@ -21,8 +21,8 @@ def _diag():
         print("• PATH contém /usr/bin?:", "/usr/bin" in os.environ.get("PATH", ""))
         print("• pdftoppm:", shutil.which("pdftoppm") or "NÃO ENCONTRADO")
         if shutil.which("pdftoppm"):
-            out = subprocess.check_output(["pdftoppm","-v"], stderr=subprocess.STDOUT).decode(errors="replace").strip()
-            print("• pdftoppm -v:", out.splitlines()[0])
+            out = subprocess.check_output(["pdftoppm","-v"], stderr=subprocess.STDOUT).decode(errors="replace").splitlines()[0]
+            print("•", out)
         print("• tesseract:", shutil.which("tesseract") or "NÃO ENCONTRADO")
     except Exception as e:
         print("• Aviso: diagnóstico falhou:", e)
@@ -56,15 +56,21 @@ NEG_TOKENS = (
     "CONHECIMENT", "DOCUMENTO AUXILIAR", "DACTE", "CHAVE", "ACESSO", "PROTOC",
     "RECEITA", "FISCO", "DESTINAT", "REMET", "TOMADOR", "QRCODE", "CONSULTE",
     "TIPO DO CT", "TIPO DO SERVI", "INICIO DA PRESTAC", "TERMINO DA PRESTAC",
-    "DATA E HORA", "MODELO", "SERIE", "NUMERO", "N PROTOCOLO", "PAGINA"
+    "DATA E HORA", "MODELO", "SERIE", "NUMERO", "N PROTOCOLO", "PAGINA",
+    "SALVADOR", "CAMAÇARI", "CAMAÇARI", "BA", "BAHIA", "ENDERECO", "ENDEREÇO"
 )
-PREF_TOKENS = (" LTDA", " S/A", " SA ", " ME ", " EPP", " MEI", " TRANSPORT", " LOGIST", " COMERC", " INDUSTR", " SERVI", " DISTRIB")
+PREF_TOKENS = (" LTDA", " S/A", " SA ", " ME ", " EPP", " MEI", " TRANSPORT", " LOGIST", " COMERC", " INDUSTR", " SERVI", " DISTRIB", " TRANS ")
+
+CITY_UF_TOKENS = (" SALVADOR", " CAMAÇARI", " CAMAÇARI", " BA", " - BA")
 
 def remover_acentos(s: str) -> str:
     return unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode("ascii")
 
 def slugify(nome: str) -> str:
     nome = remover_acentos((nome or "").strip())
+    # remove tokens numéricos (mais de 1 dígito) dentro do nome
+    nome = re.sub(r"\b\d{2,}\b", " ", nome)
+    nome = re.sub(r"\s{2,}", " ", nome).strip()
     nome = re.sub(r"\W+", "_", nome)
     nome = re.sub(r"_+", "_", nome).strip("_")
     return nome or "DESCONHECIDO"
@@ -76,7 +82,7 @@ def identificar_tipo(texto: str) -> str:
     if "BOLETO" in up or "FICHA DE COMPENSAC" in up:        return "BOLETO"
     return "DESCONHECIDO"
 
-# Padrões usados quando há texto embutido
+# Padrões quando há texto embutido
 MODELOS = {
     "WANDER_PEREIRA_DE_MATOS": {
         "regex_emissor": re.compile(r"\n([A-Z ]{5,})\s+CNPJ:\s*[\d./-]+\s+IE:", re.I),
@@ -139,15 +145,24 @@ def ocr_text(img: Image.Image) -> str:
         try: return pytesseract.image_to_string(img, config=cfg) or ""
         except Exception: return ""
 
+# ===== Heurísticas de nome do emissor =====
 def _is_bad_line(s: str) -> bool:
     u = remover_acentos(s).upper()
-    if sum(c.isdigit() for c in u) > max(2, len(u)//3):  # muita cifra = provavelmente não é nome
+    if sum(c.isdigit() for c in u) > max(2, len(u)//4):  # muito dígito => não é razão social
         return True
-    return any(tok in u for tok in NEG_TOKENS)
+    if any(tok in u for tok in NEG_TOKENS):
+        return True
+    return False
 
 def _clean_company_line(s: str) -> str:
     s = s.strip(" :.-\t")
     s = re.sub(r"^(RAZAO\s+SOCIAL|RAZAO|EMITENTE|EMISSOR|PRESTADOR(?:\s+DE\s+SERVI[ÇC]O)?|EMPRESA)\s*[:\-]*\s*", "", s, flags=re.I)
+    # Remove cidade/UF no fim
+    for tok in CITY_UF_TOKENS:
+        if remover_acentos(s).upper().endswith(tok):
+            s = s[: -len(tok)]
+    # remove tokens muito curtos ou numéricos
+    s = " ".join(t for t in s.split() if not re.fullmatch(r"\d{2,}", t) and len(t) > 1)
     s = re.sub(r"\s{2,}", " ", s)
     return s.strip()
 
@@ -156,44 +171,62 @@ def _score_company_line(s: str) -> int:
     score = len(u)
     for t in PREF_TOKENS:
         if t in u: score += 25
-    if _is_bad_line(u): score -= 80
+    if _is_bad_line(u): score -= 100
     return score
+
+def _guess_by_cnpj_block(linhas: List[str], cnpj14: Optional[str]) -> Optional[str]:
+    if not cnpj14: return None
+    tgt = cnpj14
+    for i,l in enumerate(linhas):
+        ld = _digits_only(l)
+        if tgt in ld or "CNPJ" in remover_acentos(l).upper():
+            cand_list = []
+            for j in range(max(0, i-3), i):
+                cand = _clean_company_line(linhas[j])
+                if cand and not _is_bad_line(cand):
+                    cand_list.append(cand)
+            if cand_list:
+                return max(cand_list, key=_score_company_line)
+    return None
+
+def _guess_by_dacte_block(linhas: List[str]) -> Optional[str]:
+    for i,l in enumerate(linhas):
+        if "DACTE" in remover_acentos(l).upper():
+            cand_list = []
+            for j in range(max(0, i-6), i):
+                cand = _clean_company_line(linhas[j])
+                if cand and not _is_bad_line(cand):
+                    cand_list.append(cand)
+            if cand_list:
+                return max(cand_list, key=_score_company_line)
+    return None
+
+def _guess_by_global_best(linhas: List[str]) -> Optional[str]:
+    # varre apenas o topo do documento (primeiras ~20 linhas)
+    topo = linhas[:20] if len(linhas) > 20 else linhas
+    cand_list = []
+    for l in topo:
+        cand = _clean_company_line(l)
+        if cand and not _is_bad_line(cand) and len(remover_acentos(cand)) >= 8:
+            cand_list.append(cand)
+    if cand_list:
+        return max(cand_list, key=_score_company_line)
+    return None
 
 def guess_emissor(ocr_texto: str, cnpj14: Optional[str] = None) -> str:
     if not ocr_texto:
         return "EMISSOR_DESCONHECIDO"
     linhas = [l.strip() for l in ocr_texto.splitlines() if l.strip()]
-    # 1) CNPJ: pegar a linha imediatamente ACIMA
-    if cnpj14:
-        tgt = cnpj14
-        for i,l in enumerate(linhas):
-            ld = _digits_only(l)
-            if tgt in ld:
-                candidatos = []
-                for j in range(max(0, i-3), i):
-                    cand = _clean_company_line(linhas[j])
-                    if cand and not _is_bad_line(cand):
-                        candidatos.append(cand)
-                if candidatos:
-                    return slugify(max(candidatos, key=_score_company_line))
-    # 2) Bloco próximo ao “DACTE”: pegar 5 linhas acima
-    idx_dacte = None
-    for i,l in enumerate(linhas):
-        if "DACTE" in remover_acentos(l).upper():
-            idx_dacte = i; break
-    if idx_dacte is not None:
-        candidatos = []
-        for j in range(max(0, idx_dacte-6), idx_dacte):
-            cand = _clean_company_line(linhas[j])
-            if cand and not _is_bad_line(cand):
-                candidatos.append(cand)
-        if candidatos:
-            return slugify(max(candidatos, key=_score_company_line))
-    # 3) Fallback: melhor linha longa sem tokens ruins
-    candidatos = [_clean_company_line(l) for l in linhas if not _is_bad_line(l) and len(remover_acentos(l))>=8]
-    if candidatos:
-        return slugify(max(candidatos, key=_score_company_line))
-    return "EMISSOR_DESCONHECIDO"
+
+    # 1) CNPJ (linha acima) ou linha acima de onde aparece "CNPJ"
+    nome = _guess_by_cnpj_block(linhas, cnpj14)
+    if not nome:
+        # 2) bloco acima de DACTE
+        nome = _guess_by_dacte_block(linhas)
+    if not nome:
+        # 3) melhor linha global no topo
+        nome = _guess_by_global_best(linhas)
+    return slugify(nome or "EMISSOR_DESCONHECIDO")
 
 # ===== Disposição da entrada =====
 def _dispor_entrada(caminho_pdf: str):
