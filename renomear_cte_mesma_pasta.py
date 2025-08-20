@@ -1,5 +1,5 @@
 # renomear_cte_mesma_pasta.py
-import os, re, sys, shutil, unicodedata, subprocess, argparse, statistics
+import os, re, sys, shutil, unicodedata, subprocess, argparse, statistics, json
 from typing import Optional, Tuple, List, Dict, Any
 import fitz  # PyMuPDF
 from PIL import Image, ImageOps, ImageFilter
@@ -31,6 +31,7 @@ _diag()
 
 # ===== Config =====
 load_dotenv()
+
 def _dirs_from_env():
     base = os.getcwd()
     input_dir      = os.getenv("INPUT_DIR",      os.path.join(base, "entradas"))
@@ -45,12 +46,49 @@ def _dirs_from_env():
 for pasta in (PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES, PASTA_PROCESSADOS):
     os.makedirs(pasta, exist_ok=True)
 
+# ===== Parâmetros de OCR por ENV =====
+def _as_int(env, default):
+    try:
+        return int(os.getenv(env, str(default)))
+    except Exception:
+        return default
+OCR_DPI = _as_int("OCR_DPI", 300)
 print("🔧 PASTA_ENTRADAS:", PASTA_ENTRADAS)
 print("📂 PASTA_SAIDA:", PASTA_SAIDA)
 print("📂 PASTA_PENDENTES:", PASTA_PENDENTES)
 print("📦 PASTA_PROCESSADOS:", PASTA_PROCESSADOS)
 print("📝 OUTPUT_OVERWRITE:", OUTPUT_OVERWRITE)
 print("⚙️ INPUT_DISPOSITION:", INPUT_DISPOSITION)
+print("🖨️ OCR_DPI:", OCR_DPI)
+
+# ===== Mapa CNPJ → Nome canônico =====
+def _load_cnpj_canon() -> Dict[str, str]:
+    """
+    Lê CNPJ_CANON_JSON do env (ex.: {"12512889000154":"WASHINGTON_BALTAZAR_SOUZA_LIMA_ME"}).
+    Complementa com mapa inline abaixo, se quiser fixar alguns.
+    """
+    d: Dict[str, str] = {}
+    raw = (os.getenv("CNPJ_CANON_JSON") or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            for k, v in parsed.items():
+                kdig = re.sub(r"\D+", "", str(k))
+                if kdig:
+                    d[kdig] = str(v).strip()
+        except Exception as e:
+            print(f"⚠️ CNPJ_CANON_JSON inválido: {e}")
+    # --- Fallback inline opcional (descomentando e preenchendo) ---
+    INLINE = {
+        # "12512889000154": "WASHINGTON_BALTAZAR_SOUZA_LIMA_ME",
+        # "20263922000107": "WANDER_PEREIRA_DE_MATOS",
+    }
+    d.update(INLINE)
+    return d
+
+CNPJ_CANON: Dict[str, str] = _load_cnpj_canon()
+if CNPJ_CANON:
+    print(f"🔒 CNPJ_CANON carregado ({len(CNPJ_CANON)} entr.)")
 
 # ===== Util =====
 NEG_TOKENS = (
@@ -94,8 +132,9 @@ MODELOS = {
 }
 
 # ===== Raster / pré-processamento =====
-def page_to_pil(page: fitz.Page, dpi: int = 300) -> Image.Image:
-    mat = fitz.Matrix(dpi/72.0, dpi/72.0)
+def page_to_pil(page: fitz.Page, dpi: Optional[int] = None) -> Image.Image:
+    d = dpi or OCR_DPI
+    mat = fitz.Matrix(d/72.0, d/72.0)
     pix = page.get_pixmap(matrix=mat, alpha=False)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     return img
@@ -157,6 +196,8 @@ def ocr_data(img: Image.Image) -> Dict[str, Any]:
         return {"text": [], "conf": [], "left": [], "top": [], "width": [], "height": [], "line_num": [], "block_num": [], "par_num": []}
 
 # ===== Heurísticas de nome do emissor com OCR-TSV =====
+NEG_TOKENS = NEG_TOKENS  # keep reference
+
 def _is_bad_line(s: str) -> bool:
     u = remover_acentos(s).upper()
     if sum(c.isdigit() for c in u) > max(2, len(u)//4):  # muita cifra => não é razão social
@@ -172,6 +213,8 @@ def _clean_company_line(s: str) -> str:
     s = re.split(cut_regex, remover_acentos(s), maxsplit=1, flags=re.I)[0]
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s
+
+PREF_TOKENS = PREF_TOKENS  # keep reference
 
 def _score_company_line(s: str) -> int:
     u = remover_acentos(s).upper()
@@ -313,7 +356,7 @@ def extrair_meta_pagina(pagina: fitz.Page) -> Tuple[str, str, str]:
                 return ("CTE", nome_emissor, numero_doc)
 
     # raster + QR
-    img = page_to_pil(pagina, dpi=300)
+    img = page_to_pil(pagina, dpi=OCR_DPI)
     img_p = preprocess(img)
     chave = None
     for payload in decode_qr_from_image(img_p):
@@ -330,17 +373,23 @@ def extrair_meta_pagina(pagina: fitz.Page) -> Tuple[str, str, str]:
     if tipo_doc == "DESCONHECIDO":
         tipo_doc = identificar_tipo(ocr)
 
-    nome_guess = guess_emissor_from_data(data, cnpj14) or ""
-    if not nome_guess and ocr:
-        # fallback simples: procura "CNPJ" e usa a linha de cima
-        linhas = [l.strip() for l in ocr.splitlines() if l.strip()]
-        for i,l in enumerate(linhas):
-            if "CNPJ" in remover_acentos(l).upper():
-                for j in range(max(0,i-3), i):
-                    cand = _clean_company_line(linhas[j])
-                    if cand and not _is_bad_line(cand):
-                        nome_guess = cand; break
-                if nome_guess: break
+    # ---- Nome do emissor: prioriza CNPJ_CANON, senão OCR-TSV ----
+    nome_canon = CNPJ_CANON.get(cnpj14) if cnpj14 else None
+    if nome_canon:
+        print(f"🔒 Nome canônico por CNPJ: {cnpj14} -> {nome_canon}")
+        nome_guess = nome_canon
+    else:
+        nome_guess = guess_emissor_from_data(data, cnpj14) or ""
+        if not nome_guess and ocr:
+            # fallback simples: procura "CNPJ" e usa a linha de cima
+            linhas = [l.strip() for l in ocr.splitlines() if l.strip()]
+            for i,l in enumerate(linhas):
+                if "CNPJ" in remover_acentos(l).upper():
+                    for j in range(max(0,i-3), i):
+                        cand = _clean_company_line(linhas[j])
+                        if cand and not _is_bad_line(cand):
+                            nome_guess = cand; break
+                    if nome_guess: break
 
     nome_emissor = slugify(nome_guess) if nome_guess else "EMISSOR_DESCONHECIDO"
     return (tipo_doc, nome_emissor, numero_doc)
