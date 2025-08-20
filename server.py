@@ -152,6 +152,7 @@ def download_pendente(fname):
 # ===== Worker que processa já com o emissor escolhido =====
 def _processar_e_notificar(salvos, to_number, base_url, emissor_id=None, emissor_nome=None):
     try:
+        # fixa o emissor no módulo (se suportado) apenas durante este lote
         if hasattr(proc, "set_emissor_fixo_runtime"):
             if emissor_nome:
                 proc.set_emissor_fixo_runtime(emissor_nome=emissor_nome)
@@ -172,6 +173,13 @@ def _processar_e_notificar(salvos, to_number, base_url, emissor_id=None, emissor
             print("ℹ️ Nada novo para enviar (sem renomeados gerados).")
     except Exception as e:
         print(f"⚠️ Falha no worker: {e}")
+    finally:
+        # reseta o emissor fixo no módulo para evitar vazar para próximo lote
+        if hasattr(proc, "set_emissor_fixo_runtime"):
+            try:
+                proc.set_emissor_fixo_runtime()
+            except Exception as e:
+                print(f"⚠️ Falha ao resetar emissor runtime: {e}")
 
 def _session_get_or_create(num):
     with SESS_LOCK:
@@ -198,20 +206,28 @@ def whatsapp_webhook():
     base_url = _compute_base_url(request)
     sess = _session_get_or_create(from_number)
 
-    # 1) Escolha recebida (sem mídia)
+    # 1) Escolha recebida (sem mídia): processa o que estiver pendente e SEMPRE zera a escolha
     if num_media <= 0 and body in ("1","2"):
         _set_emissor(sess, body)
         pend = list(sess["pending"])
+        sess["pending"].clear()
         if pend:
             _send_text_whatsapp(f"Ok, emissor: {EMISSOR_CHOICES[body]}. Processando {len(pend)} arquivo(s)…", from_number)
-            sess["pending"].clear()
-            threading.Thread(target=_processar_e_notificar, args=(pend, from_number, base_url, body, None), daemon=True).start()
+            # single-use: zera para forçar menu no próximo envio
+            sess["emissor"] = None
+            threading.Thread(
+                target=_processar_e_notificar,
+                args=(pend, from_number, base_url, body, None),
+                daemon=True
+            ).start()
             return Response("Processando.", 200)
         else:
-            _send_text_whatsapp(f"Emissor definido: {EMISSOR_CHOICES[body]}. Envie os PDFs agora.", from_number)
+            # nenhuma pendência: não mantém escolha; obriga novo menu no próximo envio
+            sess["emissor"] = None
+            _send_text_whatsapp("Escolha registrada. Envie os PDFs agora que eu vou perguntar novamente o emissor.", from_number)
             return Response("Aguardando PDFs.", 200)
 
-    # 2) Recebimento de PDFs
+    # 2) Recebimento de PDFs: SEMPRE exigir escolha a cada lote
     if num_media > 0:
         salvos = []
         for i in range(num_media):
@@ -238,23 +254,15 @@ def whatsapp_webhook():
         if not salvos:
             return Response("Nenhum PDF válido encontrado no envio.", 200)
 
-        # Empilha na sessão
+        # Empilha e força perguntar SEMPRE (não usa escolha anterior)
         sess["pending"].extend(salvos)
-
-        # Se já há emissor escolhido, processa; senão, envia menu
-        if sess["emissor"] in ("1","2"):
-            choice = sess["emissor"]
-            pend = list(sess["pending"])
-            sess["pending"].clear()
-            _send_text_whatsapp(f"Processando {len(pend)} arquivo(s) para {EMISSOR_CHOICES[choice]}…", from_number)
-            threading.Thread(target=_processar_e_notificar, args=(pend, from_number, base_url, choice, None), daemon=True).start()
-            return Response("Processamento iniciado.", 200)
-        else:
-            _send_text_whatsapp(MENU_TXT, from_number)
-            return Response("Escolha requerida.", 200)
+        sess["emissor"] = None  # invalida qualquer escolha anterior
+        _send_text_whatsapp(MENU_TXT, from_number)
+        return Response("Escolha requerida.", 200)
 
     # 3) Comandos auxiliares
     if body in ("menu","opcoes","opções","emissor"):
+        sess["emissor"] = None  # garante que vai perguntar
         _send_text_whatsapp(MENU_TXT, from_number)
         return Response("Menu enviado.", 200)
     if body in ("trocar","reset","alterar"):
@@ -262,7 +270,7 @@ def whatsapp_webhook():
         _send_text_whatsapp("Emissor limpo. " + MENU_TXT, from_number)
         return Response("Emissor resetado.", 200)
 
-    return Response("Envie um PDF do CT-e ou responda 1/2 para escolher emissor.", 200)
+    return Response("Envie um PDF do CT-e. Após o envio, vou pedir para escolher 1 (Wander) ou 2 (Washington).", 200)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
