@@ -55,6 +55,34 @@ def _as_int(env, default):
 OCR_DPI   = _as_int("OCR_DPI", 300)
 FORCE_OCR = (os.getenv("FORCE_OCR", "false").lower() == "true")
 
+# ===== Modo Emissor Fixo =====
+EMISSOR_CHOICES = {
+    "1": "WANDER_PEREIRA_DE_MATOS",
+    "2": "WASHINGTON_BALTAZAR_SOUZA_LIMA_ME",
+}
+EMISSOR_FIXO_ID   = (os.getenv("EMISSOR_FIXO_ID") or "").strip() or None
+EMISSOR_FIXO_NAME = (os.getenv("EMISSOR_FIXO_NAME") or "").strip() or None
+
+def remover_acentos(s: str) -> str:
+    return unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode("ascii")
+
+def slugify(nome: str) -> str:
+    nome = remover_acentos((nome or "").strip())
+    nome = re.sub(r"\b\d{2,}\b", " ", nome)
+    nome = re.sub(r"\s{2,}", " ", nome).strip()
+    nome = re.sub(r"\W+", "_", nome)
+    nome = re.sub(r"_+", "_", nome).strip("_")
+    return nome or "DESCONHECIDO"
+
+def _resolve_emissor_fixo() -> Optional[str]:
+    if EMISSOR_FIXO_NAME:
+        return slugify(EMISSOR_FIXO_NAME)
+    if EMISSOR_FIXO_ID and EMISSOR_FIXO_ID in EMISSOR_CHOICES:
+        return slugify(EMISSOR_CHOICES[EMISSOR_FIXO_ID])
+    return None
+
+EMISSOR_FIXO = _resolve_emissor_fixo()
+
 print("🔧 PASTA_ENTRADAS:", PASTA_ENTRADAS)
 print("📂 PASTA_SAIDA:", PASTA_SAIDA)
 print("📂 PASTA_PENDENTES:", PASTA_PENDENTES)
@@ -63,8 +91,9 @@ print("📝 OUTPUT_OVERWRITE:", OUTPUT_OVERWRITE)
 print("⚙️ INPUT_DISPOSITION:", INPUT_DISPOSITION)
 print("🖨️ OCR_DPI:", OCR_DPI)
 print("🧲 FORCE_OCR:", FORCE_OCR)
+print("🏷️ MODO:", "fixed" if EMISSOR_FIXO else "auto", "— emissor_fixo=", EMISSOR_FIXO or "-")
 
-# ===== Mapa CNPJ → Nome canônico =====
+# ===== Mapa CNPJ → Nome canônico (usado só no modo auto) =====
 def _load_cnpj_canon() -> Dict[str, str]:
     d: Dict[str, str] = {}
     raw = (os.getenv("CNPJ_CANON_JSON") or "").strip()
@@ -103,17 +132,6 @@ NEG_TOKENS = (
 )
 ROLE_TOKENS = ("EXPEDIDOR", "REMETENTE", "DESTINAT", "RECEBEDOR", "EMBARCADOR")
 PREF_TOKENS = (" LTDA", " S/A", " SA ", " ME ", " EPP", " MEI", " TRANSPORT", " LOGIST", " COMERC", " INDUSTR", " SERVI", " DISTRIB", " TRANS ")
-
-def remover_acentos(s: str) -> str:
-    return unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode("ascii")
-
-def slugify(nome: str) -> str:
-    nome = remover_acentos((nome or "").strip())
-    nome = re.sub(r"\b\d{2,}\b", " ", nome)
-    nome = re.sub(r"\s{2,}", " ", nome).strip()
-    nome = re.sub(r"\W+", "_", nome)
-    nome = re.sub(r"_+", "_", nome).strip("_")
-    return nome or "DESCONHECIDO"
 
 def identificar_tipo(texto: str) -> str:
     up = remover_acentos(texto).upper()
@@ -288,31 +306,26 @@ def guess_emissor_from_data(data: Dict[str, Any], cnpj14: Optional[str]) -> Opti
     if not candidates:
         return None
 
-    # 1) se existir bloco com EMITENTE/EMISSOR/PRESTADOR/TRANSPORTADOR, restringe aos CNPJs nesse(s) bloco(s)
     by_label = [(k,r) for (k,r) in candidates if r.get("block") in label_blocks]
     if by_label:
         candidates = by_label
 
-    # 2) perto do topo/DACTE
     candidates.sort(key=lambda kv: kv[1]["top"])
     if dacte_top is not None:
         near = [kv for kv in candidates if kv[1]["top"] <= dacte_top + 220]
         if near:
             candidates = near
 
-    # 3) força metade superior da página
     top_half = [kv for kv in candidates if kv[1]["top"] <= page_h * 0.60]
     if top_half:
         candidates = top_half
 
-    # escolhe o mais alto
     (b,p,ln), cnpj_rec = candidates[0]
     cnpj_x_med = statistics.median(cnpj_rec["xs"]) if cnpj_rec["xs"] else (cnpj_rec["left"] + cnpj_rec["right"]) / 2.0
 
     best_name = None
     best_score = -10**9
 
-    # avalia 1..5 linhas acima, mesma coluna
     for offset in (1,2,3,4,5):
         prev_key = (b,p,ln - offset)
         prev = lines.get(prev_key)
@@ -327,7 +340,6 @@ def guess_emissor_from_data(data: Dict[str, Any], cnpj14: Optional[str]) -> Opti
         if sc > best_score:
             best_score, best_name = sc, cand
 
-    # fallback global controlado (top 30% das linhas)
     if not best_name:
         cutoff = page_h * 0.30
         for (kb,kp,kl), rec in sorted(lines.items(), key=lambda kv: kv[1]["top"]):
@@ -361,59 +373,75 @@ def _dispor_entrada(caminho_pdf: str):
 
 # ===== Núcleo =====
 def extrair_meta_pagina(pagina: fitz.Page) -> Tuple[str, str, str]:
+    # 1) Texto embutido (para número via modelos) — nome pode ser ignorado se modo fixo
     texto = pagina.get_text("text") or ""
     tipo_doc = identificar_tipo(texto)
     has_text = bool(texto.strip())
-    nome_emissor = "EMISSOR_DESCONHECIDO"
     numero_doc = "000"
+    nome_emissor_auto = "EMISSOR_DESCONHECIDO"
 
-    print(f"🧭 Estratégia: has_text={has_text} force_ocr={FORCE_OCR}")
+    mode = "fixed" if EMISSOR_FIXO else "auto"
+    print(f"🧭 Estratégia: mode={mode} has_text={has_text} force_ocr={FORCE_OCR}")
 
-    if not FORCE_OCR and tipo_doc == "CTE" and has_text:
+    # Se texto embutido e bater com modelos, extrai NÚMERO (nome só se auto)
+    if tipo_doc == "CTE" and has_text:
         for _, regras in MODELOS.items():
-            if regras["regex_emissor"].search(texto):
-                m_emp = regras["regex_emissor"].search(texto)
-                if m_emp: nome_emissor = slugify(m_emp.group(1))
+            if regras["regex_cte"].search(texto) or regras["regex_emissor"].search(texto):
                 m_num = regras["regex_cte"].search(texto)
-                if m_num: numero_doc = str(int(m_num.group(1)))
-                print("→ Caminho: TEXT-EMBUTIDO/MODELO")
-                return ("CTE", nome_emissor, numero_doc)
+                if m_num:
+                    numero_doc = str(int(m_num.group(1)))
+                if not EMISSOR_FIXO:
+                    m_emp = regras["regex_emissor"].search(texto)
+                    if m_emp:
+                        nome_emissor_auto = slugify(m_emp.group(1))
+                print("→ Caminho: TEXT-EMBUTIDO/MODELO (número coletado)")
+                # não retornamos ainda: ainda tentaremos QR pra validar número
 
+    # 2) Raster + QR para número (prioritário)
     img = page_to_pil(pagina, dpi=OCR_DPI)
     img_p = preprocess(img)
     chave = None
     for payload in decode_qr_from_image(img_p):
         c = parse_chave_acesso_from_payload(payload)
         if c: chave = c; break
-    cnpj14 = cnpj_from_chave(chave) if chave else None
-    nct    = nct_from_chave(chave) if chave else None
-    if chave and nct:
-        tipo_doc = "CTE"; numero_doc = nct
+    nct = nct_from_chave(chave) if chave else None
+    if nct:
+        numero_doc = nct
+        tipo_doc = "CTE"
 
-    ocr = ocr_text(img_p)
-    data = ocr_data(img_p)
-    if tipo_doc == "DESCONHECIDO":
-        tipo_doc = identificar_tipo(ocr)
+    # 3) Se ainda sem número, OCR texto e tenta heurística secundária (auto) — nome só se auto
+    if numero_doc == "000":
+        ocr = ocr_text(img_p)
+        if tipo_doc == "DESCONHECIDO":
+            tipo_doc = identificar_tipo(ocr)
+        if not EMISSOR_FIXO:
+            data = ocr_data(img_p)
+            nome_guess = guess_emissor_from_data(data, cnpj_from_chave(chave) if chave else None) or ""
+            if not nome_guess and ocr:
+                linhas = [l.strip() for l in ocr.splitlines() if l.strip()]
+                for i,l in enumerate(linhas):
+                    if "CNPJ" in remover_acentos(l).upper():
+                        for j in range(max(0,i-3), i):
+                            cand = _clean_company_line(linhas[j])
+                            if cand and not _is_bad_line(cand) and not _looks_like_address(cand):
+                                nome_guess = cand; break
+                        if nome_guess: break
+            nome_emissor_auto = slugify(nome_guess) if nome_guess else nome_emissor_auto
 
-    nome_canon = CNPJ_CANON.get(cnpj14) if cnpj14 else None
-    if nome_canon:
-        nome_guess = nome_canon
-        nome_src = "canon"
+    # 4) Decide o nome conforme modo
+    if EMISSOR_FIXO:
+        nome_emissor = EMISSOR_FIXO
+        fonte_nome = "fixed"
     else:
-        nome_guess = guess_emissor_from_data(data, cnpj14) or ""
-        nome_src = "ocr-tsv"
-        if not nome_guess and ocr:
-            linhas = [l.strip() for l in ocr.splitlines() if l.strip()]
-            for i,l in enumerate(linhas):
-                if "CNPJ" in remover_acentos(l).upper():
-                    for j in range(max(0,i-3), i):
-                        cand = _clean_company_line(linhas[j])
-                        if cand and not _is_bad_line(cand) and not _looks_like_address(cand):
-                            nome_guess = cand; nome_src = "ocr-text"; break
-                    if nome_guess: break
+        # modo auto: tenta CNPJ canônico pelo QR
+        cnpj14 = cnpj_from_chave(chave) if chave else None
+        nome_canon = CNPJ_CANON.get(cnpj14) if cnpj14 else None
+        if nome_canon:
+            nome_emissor = slugify(nome_canon); fonte_nome = "canon"
+        else:
+            nome_emissor = nome_emissor_auto; fonte_nome = "ocr"
+    print(f"→ Nome: {nome_emissor} (fonte={fonte_nome}); nCT={numero_doc}")
 
-    nome_emissor = slugify(nome_guess) if nome_guess else "EMISSOR_DESCONHECIDO"
-    print(f"→ Caminho: {'FORCED-OCR' if FORCE_OCR else ('OCR' if has_text else 'OCR')}; emissor={nome_emissor}; nCT={numero_doc}; fonte={nome_src}")
     return (tipo_doc, nome_emissor, numero_doc)
 
 def processar_pdf(caminho_pdf: str) -> List[str]:
@@ -480,7 +508,21 @@ if __name__ == "__main__":
     p.add_argument("--processed", default=PASTA_PROCESSADOS)
     p.add_argument("--disposition", default=INPUT_DISPOSITION, choices=["move","delete","keep"])
     p.add_argument("--overwrite", default=OUTPUT_OVERWRITE, choices=["skip","replace"])
+    # Novo: modo emissor fixo
+    p.add_argument("--emissor-id", choices=list(EMISSOR_CHOICES.keys()))
+    p.add_argument("--emissor-fixo", help="Nome canônico do emissor para o lote (sobrepõe emissor-id)")
     a = p.parse_args()
+
+    # aplica CLI sobre env
+    if a.emissor_fixo:
+        EMISSOR_FIXO_NAME = a.emissor_fixo
+        EMISSOR_FIXO_ID = None
+    elif a.emissor_id:
+        EMISSOR_FIXO_ID = a.emissor_id
+        EMISSOR_FIXO_NAME = None
+    # recalcula emissor fixo global
+    EMISSOR_FIXO = _resolve_emissor_fixo()
+
     PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES, PASTA_PROCESSADOS = a.input, a.output, a.pendentes, a.processed
     INPUT_DISPOSITION, OUTPUT_OVERWRITE = a.disposition, a.overwrite
     for pasta in (PASTA_ENTRADAS, PASTA_SAIDA, PASTA_PENDENTES, PASTA_PROCESSADOS):
