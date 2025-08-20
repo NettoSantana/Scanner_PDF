@@ -9,7 +9,7 @@ import requests
 # processamento
 import renomear_cte_mesma_pasta as proc
 
-# opcional: reply no WhatsApp (anexos)
+# WhatsApp (Twilio)
 from twilio.rest import Client
 
 load_dotenv()
@@ -40,7 +40,7 @@ TWILIO_SID    = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_FROM   = os.getenv("TWILIO_WHATSAPP_FROM")  # ex: whatsapp:+14155238886
 
-# Base pública para montar links (opcional, mas recomendado)
+# Base pública para links
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
 
 # Limpeza pós-envio
@@ -48,6 +48,73 @@ DELETE_OUTPUT_AFTER_SEND = (os.getenv("DELETE_OUTPUT_AFTER_SEND", "true").lower(
 DELETE_DELAY_SECONDS     = int(os.getenv("DELETE_DELAY_SECONDS", "180"))
 
 app = Flask(__name__)  # server:app
+
+# ===== Sessões simples por número (menu 1/2) =====
+from threading import Lock
+SESSIONS = {}  # { from_number: {"pending": [filenames], "emissor": "1"|"2"|None} }
+SESS_LOCK = Lock()
+
+EMISSOR_CHOICES = {
+    "1": "WANDER_PEREIRA_DE_MATOS",
+    "2": "WASHINGTON_BALTAZAR_SOUZA_LIMA_ME",
+}
+
+MENU_TXT = (
+    "Escolha o emissor deste lote:\n"
+    "1) WANDER_PEREIRA_DE_MATOS\n"
+    "2) WASHINGTON_BALTAZAR_SOUZA_LIMA_ME\n"
+    "Responda com 1 ou 2."
+)
+
+def _twilio_client():
+    if not (TWILIO_SID and TWILIO_TOKEN):
+        return None
+    try:
+        return Client(TWILIO_SID, TWILIO_TOKEN)
+    except Exception:
+        return None
+
+def _send_text_whatsapp(body, to_number):
+    client = _twilio_client()
+    if not (client and TWILIO_FROM and to_number):
+        return
+    try:
+        client.messages.create(from_=TWILIO_FROM, to=to_number, body=body)
+    except Exception as e:
+        print(f"⚠️ Erro ao enviar texto WhatsApp: {e}")
+
+def _send_media_whatsapp(urls, to_number):
+    client = _twilio_client()
+    if not (client and TWILIO_FROM and to_number):
+        return
+    first = True
+    for u in urls:
+        params = {"from_": TWILIO_FROM, "to": to_number, "media_url": [u]}
+        if first:
+            params["body"] = "✅ Processado. Segue o PDF."
+        try:
+            client.messages.create(**params)
+        except Exception as e:
+            print(f"⚠️ Erro ao enviar mídia: {e}")
+        first = False
+
+def _safe_remove(path):
+    try:
+        os.remove(path)
+        print(f"🧹 Removido: {path}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"⚠️ Erro ao remover {path}: {e}")
+
+def _schedule_delete(paths, delay):
+    def _job():
+        for p in paths:
+            absp = os.path.abspath(p)
+            if absp.startswith(os.path.abspath(OUTPUT_DIR)) or absp.startswith(os.path.abspath(PENDENTES_DIR)):
+                _safe_remove(absp)
+    threading.Timer(delay, _job).start()
+    print(f"⏳ Limpeza agendada em {delay}s para {len(paths)} arquivo(s).")
 
 @app.get("/health")
 def health():
@@ -82,103 +149,120 @@ def download_renomeado(fname):
 def download_pendente(fname):
     return send_from_directory(PENDENTES_DIR, fname, as_attachment=True, mimetype="application/pdf")
 
-def _send_media_whatsapp(urls, to_number):
-    client = Client(TWILIO_SID, TWILIO_TOKEN)
-    first = True
-    for u in urls:
-        params = {"from_": TWILIO_FROM, "to": to_number, "media_url": [u]}
-        if first:
-            params["body"] = "✅ Processado. Segue o PDF."
-        client.messages.create(**params)
-        first = False
-
-def _safe_remove(path):
+# ===== Worker que processa já com o emissor escolhido =====
+def _processar_e_notificar(salvos, to_number, base_url, emissor_id=None, emissor_nome=None):
     try:
-        os.remove(path)
-        print(f"🧹 Removido: {path}")
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"⚠️ Erro ao remover {path}: {e}")
+        if hasattr(proc, "set_emissor_fixo_runtime"):
+            if emissor_nome:
+                proc.set_emissor_fixo_runtime(emissor_nome=emissor_nome)
+            elif emissor_id in ("1", "2"):
+                proc.set_emissor_fixo_runtime(emissor_id=emissor_id)
 
-def _schedule_delete(paths, delay):
-    def _job():
-        for p in paths:
-            absp = os.path.abspath(p)
-            if absp.startswith(os.path.abspath(OUTPUT_DIR)) or absp.startswith(os.path.abspath(PENDENTES_DIR)):
-                _safe_remove(absp)
-    threading.Timer(delay, _job).start()
-    print(f"⏳ Limpeza agendada em {delay}s para {len(paths)} arquivo(s).")
-
-def _processar_e_notificar(salvos, to_number, base_url):
-    try:
         caminhos_abs = [os.path.join(INPUT_DIR, n) for n in salvos]
         basenames = proc.processar_arquivos(caminhos_abs)
 
         links = [f"{base_url}/files/renomeados/{b}" for b in basenames]
         paths_abs = [os.path.join(OUTPUT_DIR, b) for b in basenames]
 
-        if links and TWILIO_SID and TWILIO_TOKEN and TWILIO_FROM and to_number:
-            try:
-                _send_media_whatsapp(links, to_number)
-                print(f"📤 WhatsApp enviado para {to_number} com {len(links)} arquivo(s).")
-                if DELETE_OUTPUT_AFTER_SEND and paths_abs:
-                    _schedule_delete(paths_abs, DELETE_DELAY_SECONDS)
-            except Exception as e:
-                print(f"⚠️ Erro ao enviar mídias: {e}. Enviando links em texto…")
-                try:
-                    client = Client(TWILIO_SID, TWILIO_TOKEN)
-                    chunk = links[:10]
-                    body = "✅ Processado.\n" + "\n".join(f"- {u}" for u in chunk)
-                    if len(links) > 10:
-                        body += f"\n(+{len(links)-10} arquivos, acesse /files)"
-                    client.messages.create(from_=TWILIO_FROM, to=to_number, body=body)
-                except Exception as e2:
-                    print(f"⚠️ Falha também no fallback de links: {e2}")
+        if links:
+            _send_media_whatsapp(links, to_number)
+            if DELETE_OUTPUT_AFTER_SEND and paths_abs:
+                _schedule_delete(paths_abs, DELETE_DELAY_SECONDS)
         else:
-            if not links:
-                print("ℹ️ Nada novo para enviar por WhatsApp (sem arquivos gerados/identificados).")
-            else:
-                print("ℹ️ Variáveis TWILIO_* ausentes; não apago arquivos.")
+            print("ℹ️ Nada novo para enviar (sem renomeados gerados).")
     except Exception as e:
-        print(f"⚠️ Falha no worker de processamento/notificação: {e}")
+        print(f"⚠️ Falha no worker: {e}")
 
+def _session_get_or_create(num):
+    with SESS_LOCK:
+        sess = SESSIONS.get(num)
+        if not sess:
+            sess = {"pending": [], "emissor": None}
+            SESSIONS[num] = sess
+        return sess
+
+def _set_emissor(sess, choice):
+    if choice in ("1","2"):
+        sess["emissor"] = choice
+        return True
+    return False
+
+# ===== Webhook Twilio =====
 @app.post("/whatsapp")
 def whatsapp_webhook():
     from_number = request.form.get("From", "")
+    body_raw = request.form.get("Body", "") or ""
+    body = body_raw.strip().lower()
     num_media = int(request.form.get("NumMedia", "0") or 0)
-    if num_media <= 0:
-        return Response("Envie um PDF do CT-e.", 200)
 
     base_url = _compute_base_url(request)
+    sess = _session_get_or_create(from_number)
 
-    salvos = []
-    for i in range(num_media):
-        content_type = (request.form.get(f"MediaContentType{i}", "") or "").lower()
-        media_url    = request.form.get(f"MediaUrl{i}", "") or ""
-        if "pdf" not in content_type or not media_url:
-            continue
-        try:
-            auth = (TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
-            with requests.get(media_url, stream=True, timeout=30, auth=auth) as r:
-                r.raise_for_status()
-                stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                nome  = f"zap_{stamp}_{i+1}.pdf"
-                caminho = os.path.join(INPUT_DIR, nome)
-                with open(caminho, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                salvos.append(nome)
-                print(f"📥 PDF salvo de {from_number}: {nome}")
-        except Exception as e:
-            print(f"⚠️ Falha ao baixar mídia {i}: {e}")
+    # 1) Escolha recebida (sem mídia)
+    if num_media <= 0 and body in ("1","2"):
+        _set_emissor(sess, body)
+        pend = list(sess["pending"])
+        if pend:
+            _send_text_whatsapp(f"Ok, emissor: {EMISSOR_CHOICES[body]}. Processando {len(pend)} arquivo(s)…", from_number)
+            sess["pending"].clear()
+            threading.Thread(target=_processar_e_notificar, args=(pend, from_number, base_url, body, None), daemon=True).start()
+            return Response("Processando.", 200)
+        else:
+            _send_text_whatsapp(f"Emissor definido: {EMISSOR_CHOICES[body]}. Envie os PDFs agora.", from_number)
+            return Response("Aguardando PDFs.", 200)
 
-    if not salvos:
-        return Response("Nenhum PDF válido encontrado no envio.", 200)
+    # 2) Recebimento de PDFs
+    if num_media > 0:
+        salvos = []
+        for i in range(num_media):
+            content_type = (request.form.get(f"MediaContentType{i}", "") or "").lower()
+            media_url    = request.form.get(f"MediaUrl{i}", "") or ""
+            if "pdf" not in content_type or not media_url:
+                continue
+            try:
+                auth = (TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
+                with requests.get(media_url, stream=True, timeout=30, auth=auth) as r:
+                    r.raise_for_status()
+                    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                    nome  = f"zap_{stamp}_{i+1}.pdf"
+                    caminho = os.path.join(INPUT_DIR, nome)
+                    with open(caminho, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    salvos.append(nome)
+                    print(f"📥 PDF salvo de {from_number}: {nome}")
+            except Exception as e:
+                print(f"⚠️ Falha ao baixar mídia {i}: {e}")
 
-    threading.Thread(target=_processar_e_notificar, args=(salvos, from_number, base_url), daemon=True).start()
-    return Response(f"Recebido(s): {', '.join(salvos)}. Processamento iniciado.", 200)
+        if not salvos:
+            return Response("Nenhum PDF válido encontrado no envio.", 200)
+
+        # Empilha na sessão
+        sess["pending"].extend(salvos)
+
+        # Se já há emissor escolhido, processa; senão, envia menu
+        if sess["emissor"] in ("1","2"):
+            choice = sess["emissor"]
+            pend = list(sess["pending"])
+            sess["pending"].clear()
+            _send_text_whatsapp(f"Processando {len(pend)} arquivo(s) para {EMISSOR_CHOICES[choice]}…", from_number)
+            threading.Thread(target=_processar_e_notificar, args=(pend, from_number, base_url, choice, None), daemon=True).start()
+            return Response("Processamento iniciado.", 200)
+        else:
+            _send_text_whatsapp(MENU_TXT, from_number)
+            return Response("Escolha requerida.", 200)
+
+    # 3) Comandos auxiliares
+    if body in ("menu","opcoes","opções","emissor"):
+        _send_text_whatsapp(MENU_TXT, from_number)
+        return Response("Menu enviado.", 200)
+    if body in ("trocar","reset","alterar"):
+        sess["emissor"] = None
+        _send_text_whatsapp("Emissor limpo. " + MENU_TXT, from_number)
+        return Response("Emissor resetado.", 200)
+
+    return Response("Envie um PDF do CT-e ou responda 1/2 para escolher emissor.", 200)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))

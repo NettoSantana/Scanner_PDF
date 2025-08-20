@@ -81,6 +81,21 @@ def _resolve_emissor_fixo() -> Optional[str]:
         return slugify(EMISSOR_CHOICES[EMISSOR_FIXO_ID])
     return None
 
+# >>> Setter em tempo de execução (chamado pelo server após o cliente escolher 1/2)
+def set_emissor_fixo_runtime(emissor_id: Optional[str] = None, emissor_nome: Optional[str] = None):
+    global EMISSOR_FIXO_ID, EMISSOR_FIXO_NAME, EMISSOR_FIXO
+    if emissor_nome:
+        EMISSOR_FIXO_NAME = emissor_nome
+        EMISSOR_FIXO_ID = None
+    elif emissor_id:
+        EMISSOR_FIXO_ID = emissor_id
+        EMISSOR_FIXO_NAME = None
+    else:
+        EMISSOR_FIXO_ID = None
+        EMISSOR_FIXO_NAME = None
+    EMISSOR_FIXO = _resolve_emissor_fixo()
+    print("🏷️ MODO atualizado runtime:", "fixed" if EMISSOR_FIXO else "auto", "— emissor_fixo=", EMISSOR_FIXO or "-")
+
 EMISSOR_FIXO = _resolve_emissor_fixo()
 
 print("🔧 PASTA_ENTRADAS:", PASTA_ENTRADAS)
@@ -330,7 +345,7 @@ def guess_emissor_from_data(data: Dict[str, Any], cnpj14: Optional[str]) -> Opti
         prev_key = (b,p,ln - offset)
         prev = lines.get(prev_key)
         if not prev: continue
-        if prev["top"] > page_h * 0.60:  # descarta rodapé/canhoto
+        if prev["top"] > page_h * 0.60:
             continue
         words_filtered = [w for w,x in zip(prev["words"], prev["xs"]) if x <= cnpj_x_med + 40]
         cand = _clean_company_line(" ".join(words_filtered)) if words_filtered else _clean_company_line(" ".join(prev["words"]))
@@ -395,7 +410,6 @@ def extrair_meta_pagina(pagina: fitz.Page) -> Tuple[str, str, str]:
                     if m_emp:
                         nome_emissor_auto = slugify(m_emp.group(1))
                 print("→ Caminho: TEXT-EMBUTIDO/MODELO (número coletado)")
-                # não retornamos ainda: ainda tentaremos QR pra validar número
 
     # 2) Raster + QR para número (prioritário)
     img = page_to_pil(pagina, dpi=OCR_DPI)
@@ -409,7 +423,7 @@ def extrair_meta_pagina(pagina: fitz.Page) -> Tuple[str, str, str]:
         numero_doc = nct
         tipo_doc = "CTE"
 
-    # 3) Se ainda sem número, OCR texto e tenta heurística secundária (auto) — nome só se auto
+    # 3) Se ainda sem número, OCR texto e tenta heurística (auto) — nome só se auto
     if numero_doc == "000":
         ocr = ocr_text(img_p)
         if tipo_doc == "DESCONHECIDO":
@@ -430,10 +444,8 @@ def extrair_meta_pagina(pagina: fitz.Page) -> Tuple[str, str, str]:
 
     # 4) Decide o nome conforme modo
     if EMISSOR_FIXO:
-        nome_emissor = EMISSOR_FIXO
-        fonte_nome = "fixed"
+        nome_emissor = EMISSOR_FIXO; fonte_nome = "fixed"
     else:
-        # modo auto: tenta CNPJ canônico pelo QR
         cnpj14 = cnpj_from_chave(chave) if chave else None
         nome_canon = CNPJ_CANON.get(cnpj14) if cnpj14 else None
         if nome_canon:
