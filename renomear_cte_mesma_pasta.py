@@ -1,10 +1,11 @@
 # renomear_cte_mesma_pasta.py
 import os, re, sys, shutil, unicodedata, subprocess, argparse
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 import fitz  # PyMuPDF
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 from pyzbar.pyzbar import decode as zbar_decode
 import pytesseract
+from pytesseract import Output
 from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv
 
@@ -57,19 +58,16 @@ NEG_TOKENS = (
     "RECEITA", "FISCO", "DESTINAT", "REMET", "TOMADOR", "QRCODE", "CONSULTE",
     "TIPO DO CT", "TIPO DO SERVI", "INICIO DA PRESTAC", "TERMINO DA PRESTAC",
     "DATA E HORA", "MODELO", "SERIE", "NUMERO", "N PROTOCOLO", "PAGINA",
-    "SALVADOR", "CAMAÇARI", "CAMAÇARI", "BA", "BAHIA", "ENDERECO", "ENDEREÇO"
+    "SALVADOR", "CAMA", "BA", "ENDERECO", "ENDEREÇO"
 )
 PREF_TOKENS = (" LTDA", " S/A", " SA ", " ME ", " EPP", " MEI", " TRANSPORT", " LOGIST", " COMERC", " INDUSTR", " SERVI", " DISTRIB", " TRANS ")
-
-CITY_UF_TOKENS = (" SALVADOR", " CAMAÇARI", " CAMAÇARI", " BA", " - BA")
 
 def remover_acentos(s: str) -> str:
     return unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode("ascii")
 
 def slugify(nome: str) -> str:
     nome = remover_acentos((nome or "").strip())
-    # remove tokens numéricos (mais de 1 dígito) dentro do nome
-    nome = re.sub(r"\b\d{2,}\b", " ", nome)
+    nome = re.sub(r"\b\d{2,}\b", " ", nome)          # tira números soltos
     nome = re.sub(r"\s{2,}", " ", nome).strip()
     nome = re.sub(r"\W+", "_", nome)
     nome = re.sub(r"_+", "_", nome).strip("_")
@@ -94,15 +92,24 @@ MODELOS = {
     },
 }
 
-# ===== Raster / QR / OCR =====
+# ===== Raster / pré-processamento =====
 def page_to_pil(page: fitz.Page, dpi: int = 300) -> Image.Image:
     mat = fitz.Matrix(dpi/72.0, dpi/72.0)
     pix = page.get_pixmap(matrix=mat, alpha=False)
-    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    return img
+
+def preprocess(img: Image.Image) -> Image.Image:
+    g = ImageOps.grayscale(img)
+    g = ImageOps.autocontrast(g)
+    g = g.filter(ImageFilter.MedianFilter(3))
+    return g
 
 def _digits_only(s: str) -> str:
     return re.sub(r"\D+", "", s or "")
 
+# ===== QR / chave / CNPJ / número =====
+from urllib.parse import urlparse, parse_qs
 def parse_chave_acesso_from_payload(payload: str) -> Optional[str]:
     if not payload: return None
     try:
@@ -134,10 +141,7 @@ def cnpj_from_chave(chave44: str) -> Optional[str]:
     if not (chave44 and len(chave44)==44 and chave44.isdigit()): return None
     return chave44[6:20]
 
-def format_cnpj(cnpj14: str) -> str:
-    if not cnpj14 or len(cnpj14)!=14: return ""
-    return f"{cnpj14[0:2]}.{cnpj14[2:5]}.{cnpj14[5:8]}/{cnpj14[8:12]}-{cnpj14[12:14]}"
-
+# ===== OCR bruto =====
 def ocr_text(img: Image.Image) -> str:
     cfg = "--oem 1 --psm 6"
     try:    return pytesseract.image_to_string(img, lang="por", config=cfg) or ""
@@ -145,24 +149,23 @@ def ocr_text(img: Image.Image) -> str:
         try: return pytesseract.image_to_string(img, config=cfg) or ""
         except Exception: return ""
 
-# ===== Heurísticas de nome do emissor =====
+def ocr_data(img: Image.Image) -> Dict[str, Any]:
+    cfg = "--oem 1 --psm 6"
+    try:
+        return pytesseract.image_to_data(img, lang="por", config=cfg, output_type=Output.DICT)
+    except Exception:
+        return {"text": [], "conf": [], "left": [], "top": [], "width": [], "height": [], "line_num": [], "block_num": [], "par_num": []}
+
+# ===== Heurísticas de nome do emissor com OCR-TSV =====
 def _is_bad_line(s: str) -> bool:
     u = remover_acentos(s).upper()
-    if sum(c.isdigit() for c in u) > max(2, len(u)//4):  # muito dígito => não é razão social
+    if sum(c.isdigit() for c in u) > max(2, len(u)//4):
         return True
-    if any(tok in u for tok in NEG_TOKENS):
-        return True
-    return False
+    return any(tok in u for tok in NEG_TOKENS)
 
 def _clean_company_line(s: str) -> str:
     s = s.strip(" :.-\t")
     s = re.sub(r"^(RAZAO\s+SOCIAL|RAZAO|EMITENTE|EMISSOR|PRESTADOR(?:\s+DE\s+SERVI[ÇC]O)?|EMPRESA)\s*[:\-]*\s*", "", s, flags=re.I)
-    # Remove cidade/UF no fim
-    for tok in CITY_UF_TOKENS:
-        if remover_acentos(s).upper().endswith(tok):
-            s = s[: -len(tok)]
-    # remove tokens muito curtos ou numéricos
-    s = " ".join(t for t in s.split() if not re.fullmatch(r"\d{2,}", t) and len(t) > 1)
     s = re.sub(r"\s{2,}", " ", s)
     return s.strip()
 
@@ -174,61 +177,133 @@ def _score_company_line(s: str) -> int:
     if _is_bad_line(u): score -= 100
     return score
 
-def _guess_by_cnpj_block(linhas: List[str], cnpj14: Optional[str]) -> Optional[str]:
-    if not cnpj14: return None
-    tgt = cnpj14
-    for i,l in enumerate(linhas):
-        ld = _digits_only(l)
-        if tgt in ld or "CNPJ" in remover_acentos(l).upper():
-            cand_list = []
-            for j in range(max(0, i-3), i):
-                cand = _clean_company_line(linhas[j])
-                if cand and not _is_bad_line(cand):
-                    cand_list.append(cand)
-            if cand_list:
-                return max(cand_list, key=_score_company_line)
-    return None
+def guess_emissor_from_data(data: Dict[str, Any], cnpj14: Optional[str]) -> Optional[str]:
+    n = len(data.get("text", []))
+    if n == 0: return None
 
-def _guess_by_dacte_block(linhas: List[str]) -> Optional[str]:
-    for i,l in enumerate(linhas):
-        if "DACTE" in remover_acentos(l).upper():
-            cand_list = []
-            for j in range(max(0, i-6), i):
-                cand = _clean_company_line(linhas[j])
-                if cand and not _is_bad_line(cand):
-                    cand_list.append(cand)
-            if cand_list:
-                return max(cand_list, key=_score_company_line)
-    return None
+    # monta linhas por (block, par, line)
+    lines: Dict[Tuple[int,int,int], Dict[str, Any]] = {}
+    for i in range(n):
+        txt = (data["text"][i] or "").strip()
+        if not txt: continue
+        conf = int(data.get("conf", ["-1"])[i]) if str(data.get("conf", ["-1"])[i]).isdigit() else -1
+        if conf < 40:  # ignora baixíssima confiança
+            continue
+        b = int(data.get("block_num", [0])[i] or 0)
+        p = int(data.get("par_num", [0])[i] or 0)
+        ln = int(data.get("line_num", [0])[i] or 0)
+        key = (b,p,ln)
+        rec = lines.setdefault(key, {"words": [], "top": 10**9, "bottom": -1})
+        rec["words"].append(txt)
+        top = int(data.get("top", [0])[i] or 0)
+        h   = int(data.get("height", [0])[i] or 0)
+        rec["top"] = min(rec["top"], top)
+        rec["bottom"] = max(rec["bottom"], top+h)
 
-def _guess_by_global_best(linhas: List[str]) -> Optional[str]:
-    # varre apenas o topo do documento (primeiras ~20 linhas)
-    topo = linhas[:20] if len(linhas) > 20 else linhas
-    cand_list = []
-    for l in topo:
-        cand = _clean_company_line(l)
-        if cand and not _is_bad_line(cand) and len(remover_acentos(cand)) >= 8:
-            cand_list.append(cand)
-    if cand_list:
-        return max(cand_list, key=_score_company_line)
-    return None
+    # procura linha que contenha "CNPJ" OU o CNPJ cru/formatado
+    def _fmt_cnpj(c):
+        if not c or len(c)!=14: return None
+        return f"{c[0:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:14]}"
+    cnpj_fmt = _fmt_cnpj(cnpj14)
 
-def guess_emissor(ocr_texto: str, cnpj14: Optional[str] = None) -> str:
-    if not ocr_texto:
-        return "EMISSOR_DESCONHECIDO"
-    linhas = [l.strip() for l in ocr_texto.splitlines() if l.strip()]
+    candidate_lines = []
+    for key, rec in lines.items():
+        line_text = " ".join(rec["words"])
+        u = remover_acentos(line_text).upper()
+        if "CNPJ" in u or (cnpj14 and cnpj14 in _digits_only(u)) or (cnpj_fmt and cnpj_fmt in u):
+            candidate_lines.append((key, rec))
 
-    # 1) CNPJ (linha acima) ou linha acima de onde aparece "CNPJ"
-    nome = _guess_by_cnpj_block(linhas, cnpj14)
-    if not nome:
-        # 2) bloco acima de DACTE
-        nome = _guess_by_dacte_block(linhas)
-    if not nome:
-        # 3) melhor linha global no topo
-        nome = _guess_by_global_best(linhas)
-    return slugify(nome or "EMISSOR_DESCONHECIDO")
+    best_name = None
+    best_score = -10**9
+    # para cada linha de CNPJ, pega 1..3 linhas imediatamente acima, no mesmo bloco
+    for (b,p,ln), rec in candidate_lines:
+        for offset in (1,2,3):
+            prev_key = (b,p,ln - offset)
+            if prev_key not in lines: continue
+            prev = lines[prev_key]
+            cand = _clean_company_line(" ".join(prev["words"]))
+            if not cand or _is_bad_line(cand): continue
+            sc = _score_company_line(cand)
+            if sc > best_score:
+                best_score, best_name = sc, cand
 
-# ===== Disposição da entrada =====
+    # fallback: bloco acima de "DACTE" (procura linha "DACTE" e olha 3..6 acima)
+    if not best_name:
+        # acha primeira linha com DACTE
+        dacte_lines = [(k,v) for k,v in lines.items() if "DACTE" in remover_acentos(" ".join(v["words"])).upper()]
+        if dacte_lines:
+            (b,p,ln), rec = sorted(dacte_lines, key=lambda kv: kv[1]["top"])[0]
+            for offset in (1,2,3,4,5,6):
+                prev_key = (b,p,ln - offset)
+                if prev_key not in lines: continue
+                prev = lines[prev_key]
+                cand = _clean_company_line(" ".join(prev["words"]))
+                if not cand or _is_bad_line(cand): continue
+                sc = _score_company_line(cand)
+                if sc > best_score:
+                    best_score, best_name = sc, cand
+
+    # fallback global: melhor linha longa no topo
+    if not best_name:
+        for (b,p,ln), rec in sorted(lines.items(), key=lambda kv: kv[1]["top"])[:25]:
+            cand = _clean_company_line(" ".join(rec["words"]))
+            if not cand or len(remover_acentos(cand)) < 8 or _is_bad_line(cand): continue
+            sc = _score_company_line(cand)
+            if sc > best_score:
+                best_score, best_name = sc, cand
+
+    return best_name
+
+# ===== Núcleo =====
+def extrair_meta_pagina(pagina: fitz.Page) -> Tuple[str, str, str]:
+    # 1) tenta texto embutido (rápido)
+    texto = pagina.get_text("text") or ""
+    tipo_doc = identificar_tipo(texto)
+    nome_emissor = "EMISSOR_DESCONHECIDO"
+    numero_doc = "000"
+
+    if tipo_doc == "CTE" and texto:
+        for _, regras in MODELOS.items():
+            if regras["regex_emissor"].search(texto):
+                m_emp = regras["regex_emissor"].search(texto)
+                if m_emp: nome_emissor = slugify(m_emp.group(1))
+                m_num = regras["regex_cte"].search(texto)
+                if m_num: numero_doc = str(int(m_num.group(1)))
+                return ("CTE", nome_emissor, numero_doc)
+
+    # 2) rasteriza + QR
+    img = page_to_pil(pagina, dpi=300)
+    img_p = preprocess(img)
+    chave = None
+    for payload in decode_qr_from_image(img_p):
+        c = parse_chave_acesso_from_payload(payload)
+        if c: chave = c; break
+    cnpj14 = cnpj_from_chave(chave) if chave else None
+    nct    = nct_from_chave(chave) if chave else None
+    if chave and nct:
+        tipo_doc = "CTE"; numero_doc = nct
+
+    # 3) OCR (texto e TSV)
+    ocr = ocr_text(img_p)
+    data = ocr_data(img_p)
+    if tipo_doc == "DESCONHECIDO":
+        tipo_doc = identificar_tipo(ocr)
+
+    nome_guess = guess_emissor_from_data(data, cnpj14) or ""
+    if not nome_guess and ocr:
+        # último recurso: heurística simples no texto corrido
+        linhas = [l.strip() for l in ocr.splitlines() if l.strip()]
+        for i,l in enumerate(linhas):
+            if "CNPJ" in remover_acentos(l).upper():
+                for j in range(max(0,i-3), i):
+                    cand = _clean_company_line(linhas[j])
+                    if cand and not _is_bad_line(cand):
+                        nome_guess = cand; break
+                if nome_guess: break
+
+    nome_emissor = slugify(nome_guess) if nome_guess else "EMISSOR_DESCONHECIDO"
+    return (tipo_doc, nome_emissor, numero_doc)
+
 def _dispor_entrada(caminho_pdf: str):
     try:
         if INPUT_DISPOSITION == "delete":
@@ -245,42 +320,6 @@ def _dispor_entrada(caminho_pdf: str):
             print("ℹ️ INPUT_DISPOSITION=keep — mantendo entradas.")
     except Exception as e:
         print(f"⚠️ Falha ao dispor entrada: {e}")
-
-# ===== Núcleo =====
-def extrair_meta_pagina(pagina: fitz.Page) -> Tuple[str, str, str]:
-    texto = pagina.get_text("text") or ""
-    tipo_doc = identificar_tipo(texto)
-    nome_emissor = "EMISSOR_DESCONHECIDO"
-    numero_doc = "000"
-
-    # Padrões quando há texto embutido
-    if tipo_doc == "CTE" and texto:
-        for _, regras in MODELOS.items():
-            if regras["regex_emissor"].search(texto):
-                m_emp = regras["regex_emissor"].search(texto)
-                if m_emp: nome_emissor = slugify(m_emp.group(1))
-                m_num = regras["regex_cte"].search(texto)
-                if m_num: numero_doc = str(int(m_num.group(1)))
-                return ("CTE", nome_emissor, numero_doc)
-
-    # Raster + QR/Barcode
-    img = page_to_pil(pagina, dpi=300)
-    chave = None
-    for payload in decode_qr_from_image(img):
-        c = parse_chave_acesso_from_payload(payload)
-        if c: chave = c; break
-    cnpj14 = cnpj_from_chave(chave) if chave else None
-    nct    = nct_from_chave(chave) if chave else None
-    if chave and nct:
-        tipo_doc = "CTE"; numero_doc = nct
-
-    # OCR
-    ocr = ocr_text(img)
-    if tipo_doc == "DESCONHECIDO":
-        tipo_doc = identificar_tipo(ocr)
-    nome_emissor = guess_emissor(ocr or texto, cnpj14) if (ocr or texto) else "EMISSOR_DESCONHECIDO"
-
-    return (tipo_doc, nome_emissor, numero_doc)
 
 def processar_pdf(caminho_pdf: str) -> List[str]:
     print(f"\n📄 Processando: {os.path.basename(caminho_pdf)}")
